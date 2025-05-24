@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Controle do Robô Bartinha</title>
+    <link rel="stylesheet" type="text/css" href="/style.css">
+    <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+</head>
+<body>
+    <h1>Controle do Robô Bartinha</h1>
+
+    <div class="controls">
+        <button onclick="iniciarRobo()">Iniciar Exploração</button>
+        <button onclick="retornarInicio()">Retornar ao Início</button>
+        <button id="btnPausarContinuar" class="warning" onclick="togglePausaRobo()">Pausar Robô</button>
+        <button class="warning" onclick="recalibrarSensores()">Refazer Calibração Linha</button>
+        <button id="btnToggleSerial" onclick="toggleSerialMonitor()">Abrir Log</button>
+    </div>
+
+    <div class="main-container">
+        <div id="mynetwork" class="map-container">
+            </div>
+
+        <div id="serialMonitorDrawer" class="serial-drawer">
+            <div id="serialMonitorHeader">
+                <h3>Log do Robô</h3>
+                <button onclick="limparSerialMonitor()">Limpar</button>
+            </div>
+            <pre id="serialOutput"></pre>
+        </div>
+    </div>
+    
+    <script type="text/javascript" src="/script.js"></script>
+</body>
+</html>

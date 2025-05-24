@@ -1,0 +1,95 @@
+body { 
+    font-family: Arial, sans-serif; 
+    margin: 0; /* Removido margin para o body */
+    padding: 20px; /* Adicionado padding ao body */
+    background-color: #f4f4f4; 
+    color: #333; 
+    display: flex;
+    flex-direction: column;
+    align-items: center; /* Centraliza o conteúdo principal */
+}
+
+h1, h2 { 
+    color: #0056b3; 
+    text-align: center; /* Centraliza títulos */
+    width: 100%;
+}
+
+.controls { 
+    margin-bottom: 20px; 
+    text-align: center; /* Centraliza botões de controle */
+}
+
+button {
+    background-color: #007bff; color: white; border: none; padding: 10px 15px;
+    text-align: center; text-decoration: none; display: inline-block;
+    font-size: 14px; margin: 8px 4px; cursor: pointer; border-radius: 5px;
+}
+button:hover { background-color: #0056b3; }
+button.warning { background-color: #ffc107; color: black; }
+button.warning:hover { background-color: #e0a800; }
+button.success { background-color: #28a745; }
+button.success:hover { background-color: #218838; }
+
+.main-container {
+    display: flex;
+    flex-direction: row; /* Mapa e log lado a lado */
+    justify-content: center; /* Centraliza os itens se houver espaço */
+    width: 100%;
+    max-width: 1200px; /* Define uma largura máxima para o container principal */
+}
+
+.map-container {
+    flex-grow: 1; /* Permite que o mapa cresça */
+    min-width: 600px; /* Largura mínima para o mapa */
+    height: 600px; 
+    border: 1px solid lightgray; 
+    background-color: white;
+}
+
+.serial-drawer {
+    width: 0; /* Começa com largura zero (escondido) */
+    height: 600px; /* Mesma altura do mapa */
+    background-color: #333;
+    color: #f0f0f0;
+    border-left: 1px solid #555;
+    display: flex;
+    flex-direction: column;
+    transition: width 0.3s ease-in-out; /* Transição na largura */
+    overflow: hidden; /* Esconde o conteúdo quando a largura é zero */
+    margin-left: 0px; /* Começa sem margem */
+    z-index: 1000;
+    box-shadow: -2px 0 5px rgba(0,0,0,0.5);
+}
+
+.serial-drawer.open {
+    width: 350px; /* Largura quando aberto */
+    margin-left: 10px; /* Espaço quando aberto */
+}
+
+#serialMonitorHeader {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 5px 10px;
+    background-color: #444;
+    border-bottom: 1px solid #555;
+    min-height: 30px; /* Altura mínima para o header ser visível */
+}
+
+#serialMonitorHeader h3 { margin: 0; font-size: 16px; }
+#serialMonitorHeader button { padding: 3px 8px; font-size: 12px; background-color: #555; }
+#serialMonitorHeader button:hover { background-color: #666; }
+
+#serialOutput {
+    flex-grow: 1;
+    padding: 10px;
+    font-family: 'Courier New', Courier, monospace;
+    font-size: 0.8em;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    overflow-y: auto;
+    background-color: #282c34;
+    color: #abb2bf;
+    margin: 0;
+}
