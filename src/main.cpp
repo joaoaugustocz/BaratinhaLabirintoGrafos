@@ -23,6 +23,51 @@ WebServer httpServer(80);
 WebSocketsServer webSocketServer = WebSocketsServer(81); // Porta 81 para WebSockets
 
 
+// Padrão bruto observado pelos sensores
+enum TipoDePadraoSensor {
+    PADRAO_LINHA_RETA,        // Sensores centrais ativos, erro PID baixo
+    PADRAO_LINHA_SUMIU_CENTRO, // Sensores centrais brancos
+    PADRAO_LATERAL_ESQUERDA_FORTE, // Sensores externos esquerdos bem ativos
+    PADRAO_LATERAL_DIREITA_FORTE,  // Sensores externos direitos bem ativos
+    PADRAO_MUITOS_SENSORES_PRETOS, // Ex: 4+ sensores pretos
+    PADRAO_QUASE_TUDO_BRANCO,      // Ex: 0 ou 1 sensor preto
+    PADRAO_AMBIGUO             // Outros casos que precisam de confirmação
+};
+
+// Classificação final do nó, após qualquer etapa de confirmação
+enum TipoDeNoFinal {
+    NO_FINAL_NAO_E,
+    NO_FINAL_BECO_SEM_SAIDA,
+    NO_FINAL_CURVA_90_ESQ,
+    NO_FINAL_CURVA_90_DIR,
+    NO_FINAL_T_COM_FRENTE_ESQ,   // Frente e Esquerda
+    NO_FINAL_T_COM_FRENTE_DIR,   // Frente e Direita
+    NO_FINAL_T_SEM_FRENTE,       // Apenas Esquerda e Direita ("pé" do T)
+    NO_FINAL_CRUZAMENTO,         // Frente, Esquerda e Direita
+    NO_FINAL_RETA_SIMPLES      // Caso especial se quisermos logar
+};
+
+// Variável global para armazenar o tipo de nó após confirmação
+TipoDeNoFinal ultimoNoClassificado = NO_FINAL_NAO_E;
+
+// Variáveis para o processo de confirmação
+bool precisaConfirmarNo = false;
+unsigned long inicioMovimentoConfirmacao = 0;
+const int DURACAO_MOV_CONFIRMACAO_MS = 400; // Avançar por 200ms (ajuste!)
+const int VELOCIDADE_CONFIRMACAO = 30;     // Velocidade baixa para avançar (ajuste!)
+TipoDePadraoSensor padraoInicialDetectado;
+
+
+
+
+enum TipoDeNo {
+  NAO_E_NO,
+  BECO_SEM_SAIDA,
+  CURVA_ESQUERDA_90,
+  CURVA_DIREITA_90,
+  INTERSECAO // Para T, Cruz (+), ou qualquer situação com múltiplas opções de caminho
+};
+
 // === ESTADOS DO ROBÔ PARA CONTROLE WEB ===
 enum EstadoRobo {
   PARADO_WEB,
@@ -30,7 +75,9 @@ enum EstadoRobo {
   SEGUINDO_LINHA_WEB,
   PAUSADO_WEB,
   EM_NO_WEB,
-  CALIBRANDO_LINHA_WEB
+  CALIBRANDO_LINHA_WEB,
+  CONFIRMANDO_NO_AVANCA, 
+  REAVALIANDO_NO_POS_AVANCO
 };
 EstadoRobo estadoRoboAtual = PARADO_WEB;
 bool exploracaoWebIniciada = false;
@@ -82,6 +129,26 @@ int current_MMAX2_reverso = MMAX2_REVERSO_3;
 
 #define setPoint 3000 // Ponto central para 7 sensores ( (7-1)*1000 / 2 )
 int I_pid = 0; 
+
+
+// --- Novas Constantes e Variáveis Globais para o PID de 3 Sensores ---
+const uint8_t NUM_SENSORES_PID = 3;
+// Índices dos sensores centrais no array 'sensorValues' (0-6 para 7 sensores)
+// Se s1=idx0, s2=idx1, s3=idx2, s4=idx3, s5=idx4, s6=idx5, s7=idx6
+// Centrais são s3, s4, s5 -> índices 2, 3, 4
+const uint8_t SENSOR_PID_OFFSET = 2; // Índice do primeiro sensor central (sensorValues[2])
+
+uint16_t posicaoPID_3sensores = 0; // Nova variável para a posição do PID (0-2000)
+const uint16_t setPoint_PID_3sensores = 1000; // Novo setPoint ( (3-1)*1000 / 2 )
+                                          // Ou simplesmente (NUM_SENSORES_PID - 1) * 1000 / 2  
+
+#define S_ESQUERDO_EXTREMO 0 // s1
+#define S_ESQUERDO_INTERNO 1 // s2
+#define S_CENTRAL_ESQUERDO 2 // s3
+#define S_CENTRAL_MEIO     3 // s4 (centro exato do array de 7 sensores)
+#define S_CENTRAL_DIREITO  4 // s5
+#define S_DIREITO_INTERNO  5 // s6
+#define S_DIREITO_EXTREMO  6 // s7
 
 //--------------------------- MPU6050 (Suas Variáveis)
 const int MPU_ADDR = 0x68;
@@ -138,7 +205,6 @@ void executarCalibracaoLinhaWebService();
 void pararMotoresWebService();
 void pid_seguelinha_original(); // Sua função PID original, se quiser usá-la
 
-
 void broadcastSerial(const String &message) { 
     Serial.print(message);
     String nonConstMessage = message; // Cria uma cópia não-constante
@@ -150,7 +216,6 @@ void broadcastSerialLn(const String &message) {
     String nonConstMessage = message + "\n"; // Cria uma cópia não-constante com newline
     webSocketServer.broadcastTXT(nonConstMessage);
 }
-
 
 void broadcastSerialF(const char *format, ...) { 
     char buf[256]; 
@@ -164,70 +229,330 @@ void broadcastSerialF(const char *format, ...) {
     webSocketServer.broadcastTXT(messageToSend); // Passe a variável
 }
 
-
-
 // --- Funções de Controle Web e Lógica do Robô ---
 void pararMotoresWebService() {
     motor('a', 'f', 0); 
     Serial.println("Motores Parados (Controle Web)");
 }
 
+
+
+// Esta função assume que sensorValues[] já foi populado por qtr.readCalibrated()
+// e que os valores estão na faixa 0-1000 (onde ~1000 = linha preta para readLineBlack)
+uint16_t calcularPosicaoPID_3Sensores(uint16_t* qtr_sensorValues) {
+    bool onLine = false;
+    uint32_t avg = 0; // Para o total ponderado
+    uint16_t sum = 0; // Para o denominador
+    uint16_t lastValue = 0; // Para desempate quando a linha é perdida
+
+    for (uint8_t i = 0; i < NUM_SENSORES_PID; i++) {
+        uint16_t currentValue = qtr_sensorValues[i + SENSOR_PID_OFFSET];
+
+        // A biblioteca QTR usa >200 para 'onLine' e >50 para incluir na média,
+        // nos valores normalizados de 0-1000 (onde 1000 é linha).
+        if (currentValue > 200) { // Limiar para considerar "na linha"
+            onLine = true;
+        }
+        if (currentValue > 50) { // Limiar para incluir na média ponderada
+            avg += (uint32_t)currentValue * (i * 1000); // i aqui é o índice local (0, 1, 2)
+            sum += currentValue;
+        }
+        if(i == (NUM_SENSORES_PID - 1) / 2) { // Guarda o valor do sensor central
+             lastValue = currentValue;
+        }
+    }
+
+    if (!onLine) {
+        // Se não detectou linha nos 3 sensores centrais:
+        // Retorna 0 se o erro anterior (ou leitura do sensor central) indicava esquerda
+        // Retorna 2000 se indicava direita
+        // Isso é um pouco diferente do QTR original, que usa _lastPosition de todos os sensores.
+        // Para 3 sensores, se o sensor central (índice 1 local) estava mais para um lado.
+        // Ou, mais simples, se a última leitura do sensor central foi baixa (branco),
+        // podemos assumir que perdemos a linha.
+        // A QTR original usa _lastPosition. Como não temos isso aqui de forma fácil,
+        // podemos usar um proxy ou simplesmente retornar uma extremidade se o erro PID anterior era grande.
+        // Por agora, vamos simplificar: se não há linha nos 3 centrais, decidimos com base no erro PID anterior.
+        if (error < 0) return 0; // Estava à esquerda
+        else return (NUM_SENSORES_PID - 1) * 1000; // Estava à direita ou no centro/perdido
+    }
+
+    return avg / sum;
+}
+
+
+// --- Funções Auxiliares para Detecção de Nós (ATUALIZADAS) ---
+
+// Retorna true se o sensor indicado está provavelmente sobre uma linha preta
+// Assume que sensorValues[sensorIndex] está na faixa 0-1000,
+// onde ~1000 é linha preta e ~0 é fundo branco (após readLineBlack).
+bool sensorVePreto(int sensorIndex) {
+    // Se o valor normalizado é alto (ex: > 700 de 1000), consideramos preto.
+    // Este limiar (700) é um ponto de partida e pode precisar de ajuste fino.
+    return sensorValues[sensorIndex] > 700; 
+}
+
+// Retorna true se o sensor indicado está provavelmente sobre uma superfície branca
+// Assume que sensorValues[sensorIndex] está na faixa 0-1000,
+// onde ~1000 é linha preta e ~0 é fundo branco (após readLineBlack).
+bool sensorVeBranco(int sensorIndex) {
+    // Se o valor normalizado é baixo (ex: < 300 de 1000), consideramos branco.
+    // Este limiar (300) é um ponto de partida e pode precisar de ajuste fino.
+    return sensorValues[sensorIndex] < 300;
+}
+
+
+TipoDePadraoSensor detectarPadraoSensores() {
+    bool s[SensorCount];
+    int contSensoresPretos = 0;
+    for (int i = 0; i < SensorCount; i++) {
+        s[i] = sensorVePreto(i); // true se preto
+        if (s[i]) contSensoresPretos++;
+    }
+
+    bool pid_frente_forte = s[S_CENTRAL_ESQUERDO] && s[S_CENTRAL_MEIO] && s[S_CENTRAL_DIREITO];
+    bool pid_sem_linha_frente = sensorVeBranco(S_CENTRAL_ESQUERDO) && sensorVeBranco(S_CENTRAL_MEIO) && sensorVeBranco(S_CENTRAL_DIREITO);
+    
+    bool tem_saida_esquerda_forte = s[S_ESQUERDO_EXTREMO] && s[S_ESQUERDO_INTERNO];
+    // bool tem_saida_esquerda_parcial = s[S_ESQUERDO_EXTREMO] || s[S_ESQUERDO_INTERNO]; // Pode usar esta se a "forte" for muito restritiva
+    bool tem_saida_direita_forte = s[S_DIREITO_EXTREMO] && s[S_DIREITO_INTERNO];
+    // bool tem_saida_direita_parcial = s[S_DIREITO_EXTREMO] || s[S_DIREITO_INTERNO];
+
+
+    // 1. Quase tudo branco -> Provável Beco sem Saída ou perda total
+    if (contSensoresPretos <= 1 && pid_sem_linha_frente) {
+        return PADRAO_QUASE_TUDO_BRANCO;
+    }
+
+    // 2. Muitos sensores pretos -> Provável grande área de intersecção
+    if (contSensoresPretos >= (SensorCount - 1)) { // 6 ou 7 sensores pretos
+        return PADRAO_MUITOS_SENSORES_PRETOS;
+    }
+    
+    // 3. Linha em frente detectada pelos sensores do PID
+    if (pid_frente_forte) {
+        if (tem_saida_esquerda_forte || tem_saida_direita_forte) {
+             // Tem frente E tem pelo menos uma saída lateral forte
+             return PADRAO_AMBIGUO; // Pode ser T c/ frente, Cruzamento ou até início de curva se o robô está desalinhado
+        }
+        // Se tem frente forte e nenhuma saída lateral forte, é uma linha reta (ou curva suave)
+        if (abs(error) < 300) { // Erro do PID (3 sensores) baixo
+            return PADRAO_LINHA_RETA;
+        } else {
+            // Erro do PID alto, mas ainda vendo linha em frente -> pode ser curva suave ou desalinhamento
+            return PADRAO_LINHA_RETA; // Ou um PADRAO_CURVA_SUAVE se quiser distinguir
+        }
+    }
+
+    // 4. Linha em frente NÃO detectada fortemente pelos 3 sensores centrais do PID
+    if (pid_sem_linha_frente || !s[S_CENTRAL_MEIO]) { // Se os centrais estão brancos ou o do meio não vê preto
+        if (tem_saida_esquerda_forte && tem_saida_direita_forte) {
+            return PADRAO_AMBIGUO; // Pode ser "pé" de T, ou um cruzamento onde a frente foi perdida momentaneamente
+        }
+        if (tem_saida_esquerda_forte) {
+            // Sem frente clara, mas esquerda forte. Provável curva de 90 esq ou T onde a frente foi perdida.
+            return PADRAO_LATERAL_ESQUERDA_FORTE; 
+        }
+        if (tem_saida_direita_forte) {
+            // Sem frente clara, mas direita forte. Provável curva de 90 dir ou T onde a frente foi perdida.
+            return PADRAO_LATERAL_DIREITA_FORTE;
+        }
+    }
+    
+    // Se o erro do PID (3 sensores) for muito grande, indica que a linha sumiu para um lado
+    if (error < -700) return PADRAO_LATERAL_ESQUERDA_FORTE; // Erro extremo p/ esquerda
+    if (error > 700)  return PADRAO_LATERAL_DIREITA_FORTE;  // Erro extremo p/ direita
+
+    return PADRAO_LINHA_RETA; // Default se nada mais se encaixar
+}
+
+// --- Função Auxiliar para Converter Enum TipoDeNoFinal para String ---
+String nomeDoNo(TipoDeNoFinal tipo) {
+    switch (tipo) {
+        case NO_FINAL_NAO_E: return "NAO_E_NO_FINAL"; // Renomeado para clareza
+        case NO_FINAL_BECO_SEM_SAIDA: return "BECO_SEM_SAIDA";
+        case NO_FINAL_CURVA_90_ESQ: return "CURVA_90_ESQ";
+        case NO_FINAL_CURVA_90_DIR: return "CURVA_90_DIR";
+        case NO_FINAL_T_COM_FRENTE_ESQ: return "T_FRENTE_ESQ";
+        case NO_FINAL_T_COM_FRENTE_DIR: return "T_FRENTE_DIR";
+        case NO_FINAL_T_SEM_FRENTE: return "T_SEM_FRENTE";
+        case NO_FINAL_CRUZAMENTO: return "CRUZAMENTO";
+        case NO_FINAL_RETA_SIMPLES: return "RETA_SIMPLES_POS_CONFIRMACAO"; // Para o caso pós-confirmação
+        default: return "NO_DESCONHECIDO (" + String(tipo) + ")";
+    }
+}
+
 void pid_controlado_web() {
     if (estadoRoboAtual != SEGUINDO_LINHA_WEB) return;
 
     lerSens(); 
-    int m1Speed_web, m2Speed_web; // Direito, Esquerdo
-
     second_lastError = lastError;
     lastError = error;
-    error = posicao - setPoint;
+    error = posicaoPID_3sensores - setPoint_PID_3sensores; 
 
-    
+    TipoDePadraoSensor padraoAtual = detectarPadraoSensores();
 
-    bool condicao_ree_especial = (abs(lastError) < 1100 && abs(second_lastError) < 1100);
-
-    if (abs(error) >= setPoint - 100 && !condicao_ree_especial) { 
-        //Serial.print("NÓ WEB Detectado! Erro: "); Serial.println(error);
-        broadcastSerialLn("NÓ WEB Detectado! Erro: " + String(error));
+    // --- LÓGICA DE TRANSIÇÃO DE ESTADO ---
+    if (padraoAtual == PADRAO_QUASE_TUDO_BRANCO) {
+        broadcastSerialLn("PADRAO_QUASE_TUDO_BRANCO detectado.");
         pararMotoresWebService();
+        ultimoNoClassificado = NO_FINAL_BECO_SEM_SAIDA;
+        broadcastSerialLn("Nó Classificado Direto: " + nomeDoNo(ultimoNoClassificado)); // MENSAGEM ÚNICA
         estadoRoboAtual = EM_NO_WEB;
-        I_pid = 0; 
-        return; 
+        I_pid = 0;
+        return;
+    } else if (padraoAtual == PADRAO_LATERAL_ESQUERDA_FORTE && abs(error) > 700 && sensorVeBranco(S_DIREITO_EXTREMO)) { 
+        // Se erro do PID é grande e apenas um lado claramente ativo
+        // (condição mais forte para curva, evitando confusão com T)
+        broadcastSerialLn("PADRAO_LATERAL_ESQUERDA_FORTE (provável curva) detectado.");
+        pararMotoresWebService();
+        ultimoNoClassificado = NO_FINAL_CURVA_90_ESQ;
+        broadcastSerialLn("Nó Classificado Direto: " + nomeDoNo(ultimoNoClassificado)); // MENSAGEM ÚNICA
+        estadoRoboAtual = EM_NO_WEB;
+        I_pid = 0;
+        return;
+    } else if (padraoAtual == PADRAO_LATERAL_DIREITA_FORTE && abs(error) > 700 && sensorVeBranco(S_ESQUERDO_EXTREMO)) {
+        broadcastSerialLn("PADRAO_LATERAL_DIREITA_FORTE (provável curva) detectado.");
+        pararMotoresWebService();
+        ultimoNoClassificado = NO_FINAL_CURVA_90_DIR;
+        broadcastSerialLn("Nó Classificado Direto: " + nomeDoNo(ultimoNoClassificado)); // MENSAGEM ÚNICA
+        estadoRoboAtual = EM_NO_WEB;
+        I_pid = 0;
+        return;
+    } else if (padraoAtual == PADRAO_AMBIGUO || padraoAtual == PADRAO_MUITOS_SENSORES_PRETOS ||
+               (padraoAtual == PADRAO_LATERAL_DIREITA_FORTE && abs(error) <= 700) || // Lateral forte mas erro PID não tão extremo
+               (padraoAtual == PADRAO_LATERAL_ESQUERDA_FORTE && abs(error) <= 700) ) {
+        pararMotoresWebService(); // Para antes de avançar
+        broadcastSerialLn("Padrão AMBIGUO/INTERSECAO INICIAL detectado (" + String(padraoAtual) + "). Avançando para confirmar...");
+        padraoInicialDetectado = padraoAtual; // Guarda o padrão inicial
+        precisaConfirmarNo = true;
+        estadoRoboAtual = CONFIRMANDO_NO_AVANCA;
+        inicioMovimentoConfirmacao = millis();
+        motor('a', 'f', VELOCIDADE_CONFIRMACAO); // Inicia o movimento de avanço
+        I_pid = 0;
+        return;
     }
+    // Se for PADRAO_LINHA_RETA ou não se encaixar acima, continua PID
     
-    if (abs(error) == 3000 && condicao_ree_especial) {
-        error = 0; 
-        Serial.println("WEB: Condição REEEEEEEEE especial do PID original, erro zerado.");
-        // A lógica de "REEEEEEEEE" de ir pra frente rápido está na sua pid_seguelinha_original.
-        // Aqui, apenas zeramos o erro para o cálculo do PID desta iteração.
-        // Se quiser replicar o impulso, adicione aqui, mas pode conflitar com "parar no nó".
-    }
-
+    // Lógica PID (como antes, mas sem a detecção de nó original)
     I_pid = I_pid + error;
-    I_pid = constrain(I_pid, -10000, 10000); 
+    I_pid = constrain(I_pid, -5000, 5000); // Ajuste este limite se necessário
     
     int motorSpeedCorrection = current_KP * error + current_KD * (error - lastError) + current_KI * I_pid;
     
-    
-
-    if (abs(error) <= 200) {
+    int m1Speed_web, m2Speed_web;
+    if (abs(error) <= 100) { // Limiar para "reta" no PID de 3 sensores
         m1Speed_web = current_Mm1_reta - motorSpeedCorrection; 
         m2Speed_web = current_Mm2_reta + motorSpeedCorrection; 
     } else {
         m1Speed_web = current_M1_base - motorSpeedCorrection; 
         m2Speed_web = current_M2_base + motorSpeedCorrection; 
     }
-    
     m1Speed_web = constrain(m1Speed_web, current_MMAX2_reverso, current_MMAX_curva);
     m2Speed_web = constrain(m2Speed_web, current_MMAX2_reverso, current_MMAX_curva);
     
     if(m1Speed_web < 0) motor('d', 't', abs(m1Speed_web)); 
     else motor('d', 'f', abs(m1Speed_web));
-    
     if(m2Speed_web < 0) motor('e', 't', abs(m2Speed_web));
     else motor('e', 'f', abs(m2Speed_web));
 }
 
+
+
+// Nova função para classificar após o avanço
+void classificarNoAposAvanco(TipoDePadraoSensor padraoAntesDoAvanco) {
+    // 'sensorValues' já foi atualizado no estado REAVALIANDO_NO_POS_AVANCO
+    bool s_depois[SensorCount];
+    int contPretos_depois = 0;
+    for (int i = 0; i < SensorCount; i++) {
+        s_depois[i] = sensorVePreto(i);
+        if (s_depois[i]) contPretos_depois++;
+    }
+
+    bool frente_depois = s_depois[S_CENTRAL_ESQUERDO] && s_depois[S_CENTRAL_MEIO] && s_depois[S_CENTRAL_DIREITO];
+    bool esquerda_depois = s_depois[S_ESQUERDO_EXTREMO] || s_depois[S_ESQUERDO_INTERNO];
+    bool direita_depois = s_depois[S_DIREITO_EXTREMO] || s_depois[S_DIREITO_INTERNO];
+
+    broadcastSerialLn("[ConfirmNode] Pós-Avanço: F=" + String(frente_depois) + " E=" + String(esquerda_depois) + " D=" + String(direita_depois) + " Pretos=" + String(contPretos_depois));
+
+    // --- Lógica de Decisão Final ---
+    // Exemplo para o caso que era PADRAO_LATERAL_DIREITA_FORTE ou AMBIGUO (tendendo a direita)
+    if (padraoAntesDoAvanco == PADRAO_LATERAL_DIREITA_FORTE || 
+        (padraoAntesDoAvanco == PADRAO_AMBIGUO && direita_depois) ) { // Se o padrão inicial sugeria direita
+
+        if (!frente_depois && direita_depois && !esquerda_depois) {
+            // Linha em frente sumiu, só tem direita forte
+            ultimoNoClassificado = NO_FINAL_CURVA_90_DIR;
+        } else if (frente_depois && direita_depois && !esquerda_depois) {
+            ultimoNoClassificado = NO_FINAL_T_COM_FRENTE_DIR;
+        } else if (frente_depois && direita_depois && esquerda_depois) {
+            ultimoNoClassificado = NO_FINAL_CRUZAMENTO;
+        } else if (!frente_depois && direita_depois && esquerda_depois) {
+            ultimoNoClassificado = NO_FINAL_T_SEM_FRENTE; // Estava no pé do T e confirmou
+        } else if (!frente_depois && !direita_depois && !esquerda_depois && contPretos_depois <=1) {
+            // Tudo sumiu após o avanço -> provavelmente um beco ou overshot
+            ultimoNoClassificado = NO_FINAL_BECO_SEM_SAIDA; // Ou um tipo de erro
+        }
+         else { // Não conseguiu classificar claramente, talvez continuar reto se houver frente?
+            if(frente_depois) {
+                ultimoNoClassificado = NO_FINAL_RETA_SIMPLES; // Ou um T_COM_FRENTE_DIR se a direita ainda estiver lá
+                 if (direita_depois) ultimoNoClassificado = NO_FINAL_T_COM_FRENTE_DIR;
+                 else if (esquerda_depois) ultimoNoClassificado = NO_FINAL_T_COM_FRENTE_ESQ; // Improvável se o erro era para direita
+            } else {
+                broadcastSerialLn("[ConfirmNode] Classificação DIREITA incerta pós-avanço.");
+                ultimoNoClassificado = NO_FINAL_NAO_E; // Ou um tipo de erro específico
+            }
+        }
+    } 
+    // Adicionar lógica similar para PADRAO_LATERAL_ESQUERDA_FORTE e outros PADRAO_AMBIGUO
+    else if (padraoAntesDoAvanco == PADRAO_LATERAL_ESQUERDA_FORTE ||
+             (padraoAntesDoAvanco == PADRAO_AMBIGUO && esquerda_depois)) {
+        if (!frente_depois && esquerda_depois && !direita_depois) {
+            ultimoNoClassificado = NO_FINAL_CURVA_90_ESQ;
+        } else if (frente_depois && esquerda_depois && !direita_depois) {
+            ultimoNoClassificado = NO_FINAL_T_COM_FRENTE_ESQ;
+        } else if (frente_depois && direita_depois && esquerda_depois) {
+            ultimoNoClassificado = NO_FINAL_CRUZAMENTO;
+        } else if (!frente_depois && direita_depois && esquerda_depois) {
+            ultimoNoClassificado = NO_FINAL_T_SEM_FRENTE;
+        } else if (!frente_depois && !direita_depois && !esquerda_depois && contPretos_depois <=1) {
+            ultimoNoClassificado = NO_FINAL_BECO_SEM_SAIDA;
+        } else {
+             if(frente_depois) {
+                ultimoNoClassificado = NO_FINAL_RETA_SIMPLES;
+                if (esquerda_depois) ultimoNoClassificado = NO_FINAL_T_COM_FRENTE_ESQ;
+                else if (direita_depois) ultimoNoClassificado = NO_FINAL_T_COM_FRENTE_DIR;
+            } else {
+                broadcastSerialLn("[ConfirmNode] Classificação ESQUERDA incerta pós-avanço.");
+                ultimoNoClassificado = NO_FINAL_NAO_E;
+            }
+        }
+    }
+    else if (padraoAntesDoAvanco == PADRAO_MUITOS_SENSORES_PRETOS || 
+             (padraoAntesDoAvanco == PADRAO_AMBIGUO && frente_depois) ) { // Estava numa área preta grande
+        if (frente_depois && esquerda_depois && direita_depois) ultimoNoClassificado = NO_FINAL_CRUZAMENTO;
+        else if (frente_depois && esquerda_depois) ultimoNoClassificado = NO_FINAL_T_COM_FRENTE_ESQ;
+        else if (frente_depois && direita_depois) ultimoNoClassificado = NO_FINAL_T_COM_FRENTE_DIR;
+        else if (!frente_depois && esquerda_depois && direita_depois) ultimoNoClassificado = NO_FINAL_T_SEM_FRENTE;
+        else if (frente_depois) ultimoNoClassificado = NO_FINAL_RETA_SIMPLES; // Ou um T mal detectado
+        else {
+            broadcastSerialLn("[ConfirmNode] Classificação ÁREA PRETA incerta pós-avanço.");
+            ultimoNoClassificado = NO_FINAL_NAO_E; // Ou um tipo de erro específico
+        }
+    } else {
+        broadcastSerialLn("[ConfirmNode] Padrão inicial não tratado para reclassificação: " + String(padraoAntesDoAvanco));
+        ultimoNoClassificado = NO_FINAL_NAO_E;
+    }
+
+
+    if (ultimoNoClassificado == NO_FINAL_NAO_E || ultimoNoClassificado == NO_FINAL_RETA_SIMPLES) {
+        estadoRoboAtual = SEGUINDO_LINHA_WEB; // Volta a seguir linha se não for um nó conclusivo
+        broadcastSerialLn("[ConfirmNode] Decisão: Não é um nó definitivo ou é reta. Retomando seguimento de linha.");
+    } else {
+        estadoRoboAtual = EM_NO_WEB; // Nó classificado, para para processamento do grafo
+        broadcastSerialLn("[ConfirmNode] Decisão Final do Nó: " + nomeDoNo(ultimoNoClassificado));
+    }
+}
 
 
 void handleIniciarWeb() {
@@ -275,19 +600,6 @@ void handleRecalibrarLinhaWeb() {
 }
 
 void handleNotFound() { httpServer.send(404, "text/plain", "Nao Encontrado"); }
-
-// --- Função para Broadcast de Mensagens (Serial + WebSocket) ---
-// void broadcastSerial(String message) { 
-//     Serial.print(message); 
-//     webSocketServer.broadcastTXT(message); 
-// }
-
-// void broadcastSerialLn(String message) { // Alterado para passar por valor
-//     Serial.println(message);
-//     String msgWithNewline = message + "\n";
-//     webSocketServer.broadcastTXT(msgWithNewline); 
-// }
-
 
 // --- Eventos do WebSocket ---
 void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
@@ -339,7 +651,6 @@ String getContentType(String filename) {
 }
 
 // Função para servir arquivos do LittleFS
-
 bool handleFileRead(String path) {
     // Usar broadcastSerialLn para que você veja isso no drawer da web também, quando funcionar
     broadcastSerialLn("[HTTP FS] handleFileRead: Req inicial: '" + path + "'");
@@ -385,7 +696,6 @@ bool handleFileRead(String path) {
     return false; 
 }
 
-
 void executarCalibracaoLinhaWebService() {
     // O handler HTTP apenas muda o estado. A execução ocorre aqui no loop.
     // No entanto, como esta função é bloqueante, ela pode ser chamada diretamente pelo handler
@@ -422,7 +732,6 @@ void executarCalibracaoLinhaWebService() {
     broadcastSerialLn(" ");
     estadoRoboAtual = PARADO_WEB; // Define o estado após a calibração
 }
-
 
 // --- SETUP ---
 void setup() {
@@ -538,9 +847,9 @@ void setup() {
     }
     previousTime_mpu = micros();
 
-    Serial.println("Calibração inicial dos sensores de linha no setup...");
-    broadcastSerialLn("Calibração inicial dos sensores de linha no setup...");
-    executarCalibracaoLinhaWebService(); 
+    //Serial.println("Calibração inicial dos sensores de linha no setup...");
+    //broadcastSerialLn("Calibração inicial dos sensores de linha no setup...");
+    //executarCalibracaoLinhaWebService(); 
 
     Serial.println("Fim setup. Robô pronto em estado PARADO_WEB.");
     broadcastSerialLn("Fim setup. Robô pronto em estado PARADO_WEB.");
@@ -552,33 +861,60 @@ void setup() {
 // --- LOOP PRINCIPAL ---
 void loop() {
     httpServer.handleClient(); 
-    webSocketServer.loop(); // ESSENCIAL: Processa eventos WebSocket
+    webSocketServer.loop();    
 
     switch (estadoRoboAtual) {
         case PARADO_WEB: break; 
         case INICIANDO_EXPLORACAO_WEB:
             broadcastSerialLn("WEB: Iniciando Exploração -> Seguindo Linha");
             estadoRoboAtual = SEGUINDO_LINHA_WEB;
+            precisaConfirmarNo = false; // Reseta flag de confirmação
             break;
+
         case SEGUINDO_LINHA_WEB:
-            //pid_controlado_web();
-            pid_seguelinha_original(); 
+            if (precisaConfirmarNo) { // Se estava confirmando e voltou para seguir linha (decisão foi NAO_E_NO)
+                precisaConfirmarNo = false;
+            }
+            pid_controlado_web(); // Esta função agora vai detectar e pode mudar o estado
             break;
+
+        case CONFIRMANDO_NO_AVANCA: // Novo estado
+            // Verifica se o tempo de avanço já passou
+            if (millis() - inicioMovimentoConfirmacao >= DURACAO_MOV_CONFIRMACAO_MS) {
+                pararMotoresWebService();
+                broadcastSerialLn("[ConfirmNode] Avanço concluído. Reavaliando...");
+                estadoRoboAtual = REAVALIANDO_NO_POS_AVANCO;
+            } else {
+                // Continua avançando devagar (já iniciado em pid_controlado_web)
+                // motor('a', 'f', VELOCIDADE_CONFIRMACAO); // Certifique-se que o motor está andando
+            }
+            break;
+
+        case REAVALIANDO_NO_POS_AVANCO: // Novo estado
+            lerSens(); // Lê os sensores após o pequeno avanço
+            classificarNoAposAvanco(padraoInicialDetectado); // Nova função para tomar a decisão final
+                                                             // Esta função definirá ultimoNoClassificado e mudará estado para EM_NO_WEB
+            precisaConfirmarNo = false;
+            break;
+
         case PAUSADO_WEB: break;
         case EM_NO_WEB:
-            broadcastSerialLn("WEB: Robô em Nó. Aguardando...");
+            //broadcastSerialLn("WEB: Robô em Nó (" + nomeDoNo(ultimoNoClassificado) + "). Aguardando...");
+            // Aqui você precisaria de uma lógica para o robô decidir o que fazer
+            // com base no 'ultimoNoClassificado' e no seu algoritmo de grafo.
+            // Por enquanto, ele para. Para reiniciar a exploração, o usuário clica em "Iniciar".
             break;
         case CALIBRANDO_LINHA_WEB:
-            // A calibração é chamada diretamente pelo handler HTTP e é bloqueante.
-            // Se o handler apenas mudasse o estado, a chamada seria aqui:
-            // executarCalibracaoLinhaWebService(); 
+            // Como a calibração é bloqueante e chamada pelo handler, este case pode não ser muito usado no loop
             break;
         default:
             pararMotoresWebService(); estadoRoboAtual = PARADO_WEB;
+            broadcastSerialLn("[AVISO] Estado desconhecido, robô parado.");
             break;
     }
     delay(10); 
 }
+
 
 // --- Implementação das Suas Funções ---
 void setColor(char sensor, int h, int s, int v) {
@@ -640,7 +976,19 @@ void motor(char lado, char dir , int pwm) {
 }
 
 void lerSens() {
-  posicao = qtr.readLineBlack(sensorValues);
+    qtr.readCalibrated(sensorValues); // Popula 'sensorValues' com todos os 7 sensores (0-1000, onde ~1000=preto)
+    
+    // Calcula a posição para o PID usando os 3 sensores centrais
+    posicaoPID_3sensores = calcularPosicaoPID_3Sensores(sensorValues); 
+
+    // Opcional: ainda calcular a posição com todos os sensores se 'detectarTipoDeNo' usar
+    // Se não for usar a 'posicao' (0-6000) original, pode remover esta linha.
+    // posicao = qtr.readLineBlack(sensorValues); // Isto re-chamaria readCalibrated, o que não é ideal.
+                                               // Se precisar da posicao 0-6000, é melhor ter uma função
+                                               // que a calcule a partir do 'sensorValues' já lido,
+                                               // similar a calcularPosicaoPID_3Sensores mas para 7 sensores.
+                                               // Por agora, vamos focar no PID com 3 sensores.
+                                               // 'detectarTipoDeNo' usará o array 'sensorValues' diretamente.
 }
 
 // Sua função PID original, caso queira usá-la por outros meios (não chamada pela web diretamente)
