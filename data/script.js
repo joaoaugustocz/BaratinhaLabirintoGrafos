@@ -5,12 +5,10 @@ var webSocket;
 
 // Configuração do grafo Vis.js
 var nodes = new vis.DataSet([
-    {id: 1, label: 'Início'}, {id: 2, label: 'Nó 2'},
-    {id: 3, label: 'Nó 3'}, {id: 4, label: 'Fim'}
+
 ]);
 var edges = new vis.DataSet([
-    {from: 1, to: 2, label: 'Caminho A'}, {from: 1, to: 3, label: 'Caminho B'},
-    {from: 2, to: 4, label: 'Caminho C'}, {from: 3, to: 4, label: 'Caminho D'}
+
 ]);
 var data = { nodes: nodes, edges: edges };
 var options = { 
@@ -79,16 +77,33 @@ function initWebSocket() {
 
     webSocket.onmessage = function(event) {
         var serialOutput = document.getElementById('serialOutput');
-        var message = event.data.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+        var messageData = event.data; // A mensagem pura
         
-        // Adiciona timestamp (opcional)
-        var now = new Date();
-        var timestamp = now.getHours().toString().padStart(2, '0') + ':' + 
-                        now.getMinutes().toString().padStart(2, '0') + ':' + 
-                        now.getSeconds().toString().padStart(2, '0') + '.ms' +
-                        now.getMilliseconds().toString().padStart(3, '0');
+        // Tenta processar como comando de grafo primeiro
+        var parts = messageData.split(':');
+        var command = parts[0];
 
-        serialOutput.innerHTML += '<span class="timestamp">[' + timestamp + ']</span> ' + message + '\n';
+        if (command === "newNode" && parts.length >= 3) {
+            var nodeId = parseInt(parts[1]);
+            var nodeLabel = parts.slice(2).join(':'); // Reconstrói o label caso ele contenha ':'
+            adicionarNo(nodeId, nodeLabel);
+            // Adiciona ao log também
+            serialOutput.innerHTML += '<span style="color: #98c379;">[MAPA] Novo Nó: ID=' + nodeId + ', Label=' + nodeLabel + '</span>\n';
+        } else if (command === "newEdge" && parts.length >= 3) { // Precisa de pelo menos from:to
+            var fromNode = parseInt(parts[1]);
+            var toNode = parseInt(parts[2]);
+            var edgeLabel = (parts.length >= 4) ? parts.slice(3).join(':') : ""; // Label opcional
+            adicionarAresta(fromNode, toNode, edgeLabel);
+            serialOutput.innerHTML += '<span style="color: #61afef;">[MAPA] Nova Aresta: ' + fromNode + ' -> ' + toNode + (edgeLabel ? ' ('+edgeLabel+')' : '') + '</span>\n';
+        } else {
+            // Se não for um comando de grafo, trata como mensagem de log normal
+            var now = new Date();
+            var timestamp = now.getHours().toString().padStart(2, '0') + ':' + 
+                            now.getMinutes().toString().padStart(2, '0') + ':' + 
+                            now.getSeconds().toString().padStart(2, '0');
+            var sanitizedMessage = messageData.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+            serialOutput.innerHTML += '<span class="timestamp">[' + timestamp + ']</span> ' + sanitizedMessage; // Removido \n extra, pois broadcastSerialLn já adiciona
+        }
         serialOutput.scrollTop = serialOutput.scrollHeight; 
     };
 
@@ -130,13 +145,37 @@ function limparSerialMonitor() {
 }
 
 // Funções para atualizar o grafo (você já as tinha)
-function adicionarNo(id, label) { 
-    try { nodes.add({id: id, label: label}); } 
-    catch(err) { console.error("Erro ao adicionar nó:", err, "ID:", id, "Label:", label); }
+function adicionarNo(nodeId, nodeLabel) { 
+    try {
+        if (nodes.get(nodeId) == null) { // Só adiciona se o nó não existir
+            nodes.add({id: nodeId, label: nodeLabel || ('Nó ' + nodeId)});
+            console.log("Nó Adicionado:", nodeId, nodeLabel);
+        } else {
+            console.log("Nó já existe:", nodeId);
+            // Opcional: atualizar o label se necessário
+            // nodes.update({id: nodeId, label: nodeLabel || ('Nó ' + nodeId)});
+        }
+    } catch(err) { 
+        console.error("Erro ao adicionar nó:", err, "ID:", nodeId, "Label:", nodeLabel); 
+    }
 }
-function adicionarAresta(from, to, label) { 
-    try { edges.add({from: from, to: to, label: label || ''}); }
-    catch(err) { console.error("Erro ao adicionar aresta:", err, "De:", from, "Para:", to, "Label:", label); }
+
+function adicionarAresta(fromNodeId, toNodeId, edgeLabel) { 
+    try {
+        // Evitar arestas duplicadas (Vis.js pode lidar com isso, mas uma checagem pode ser útil)
+        // Um ID de aresta pode ser fromNodeId + "-" + toNodeId
+        var edgeId = String(fromNodeId) + "-" + String(toNodeId);
+        var reverseEdgeId = String(toNodeId) + "-" + String(fromNodeId); // Para grafos não direcionados no display
+
+        if (edges.get(edgeId) == null && edges.get(reverseEdgeId) == null) {
+            edges.add({id: edgeId, from: fromNodeId, to: toNodeId, label: edgeLabel || ''});
+            console.log("Aresta Adicionada:", fromNodeId, "->", toNodeId, edgeLabel);
+        } else {
+            console.log("Aresta já existe:", edgeId, "ou", reverseEdgeId);
+        }
+    } catch(err) { 
+        console.error("Erro ao adicionar aresta:", err, "De:", fromNodeId, "Para:", toNodeId, "Label:", edgeLabel); 
+    }
 }
 
 // Inicializar WebSocket quando a página carregar

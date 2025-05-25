@@ -8,6 +8,21 @@
 #include <LittleFS.h>         // Usando LittleFS
 
 
+//------ GRAFOS ------------//
+
+// Variáveis globais para o mapeamento simples
+int idProximoNo = 0;        // Contador para gerar IDs de nós únicos
+int idNoAtual = -1;         // ID do nó onde o robô está ou acabou de classificar
+int idNoAnterior = -1;      // ID do nó de onde o robô veio para chegar ao nó atual
+bool primeiroNo = true;     // Flag para tratar o nó inicial
+
+
+
+//------ GRAFOS ------------//
+
+
+
+
 
 // --- Configurações de Wi-Fi ---
 const char* ssid = "Joao_2G";
@@ -41,7 +56,8 @@ enum TipoDeNoFinal {
     NO_FINAL_T_COM_FRENTE_DIR,   // Frente e Direita
     NO_FINAL_T_SEM_FRENTE,       // Apenas Esquerda e Direita ("pé" do T)
     NO_FINAL_CRUZAMENTO,         // Frente, Esquerda e Direita
-    NO_FINAL_RETA_SIMPLES      // Caso especial se quisermos logar
+    NO_FINAL_RETA_SIMPLES,      // Caso especial se quisermos logar
+    NO_FINAL_FIM_DO_LABIRINTO  // <<< NOVO TIPO AQUI
 };
 
 // Variável global para armazenar o tipo de nó após confirmação
@@ -189,6 +205,17 @@ uint16_t sensorValues[SensorCount];
 #define NUM_LEDS 4
 #define DATA_PIN GPIO_NUM_48
 CRGB leds[NUM_LEDS];
+
+
+// Constantes para Viradas Precisas (AJUSTE ESTES VALORES EXPERIMENTALMENTE!)
+const int VELOCIDADE_ROTACAO_PRECISA = 60;    // Velocidade dos motores durante a rotação (0-255)
+const int TEMPO_MINIMO_PARA_SAIR_DA_LINHA_MS = 100; // Tempo mínimo girando antes de procurar nova linha (evita re-detectar a linha original)
+const int TIMEOUT_VIRADA_90_MS = 2500;       // Timeout máximo para virada de 90 graus (2.5 segundos)
+const int TIMEOUT_VIRADA_180_MS = 4000;      // Timeout máximo para virada de 180 graus (4 segundos)
+const int LIMIAR_ALINHAMENTO_VIRADA = 200;   // Quão perto de setPoint_PID_3sensores (1000) para considerar alinhado (faixa +/- 200)
+
+const int VELOCIDADE_AJUSTE_FINAL = 30;     // Velocidade para pequeno avanço/recuo após virada
+const int TEMPO_AJUSTE_FINAL_MS = 70;       // Duração do pequeno avanço/recuo
 
 // --- Protótipos ---
 void setColor(char sensor, int h, int s, int v);
@@ -356,6 +383,7 @@ String nomeDoNo(TipoDeNoFinal tipo) {
         case NO_FINAL_T_SEM_FRENTE: return "T_SEM_FRENTE";
         case NO_FINAL_CRUZAMENTO: return "CRUZAMENTO";
         case NO_FINAL_RETA_SIMPLES: return "RETA_SIMPLES_POS_CONFIRMACAO"; // Para o caso pós-confirmação
+        case NO_FINAL_FIM_DO_LABIRINTO: return "FIM_DO_LABIRINTO"; // <<< ADICIONAR
         default: return "NO_DESCONHECIDO (" + String(tipo) + ")";
     }
 }
@@ -446,97 +474,68 @@ void pid_controlado_web() {
 
 
 // Nova função para classificar após o avanço
-void classificarNoAposAvanco(TipoDePadraoSensor padraoAntesDoAvanco) {
-    // 'sensorValues' já foi atualizado no estado REAVALIANDO_NO_POS_AVANCO
-    bool s_depois[SensorCount];
-    int contPretos_depois = 0;
+void classificarNoAposAvanco(TipoDePadraoSensor padraoDetectadoAntesDoAvanco) {
+    lerSens(); // Sempre releia os sensores no momento da classificação final
+    bool s_final[SensorCount];
+    int contPretos_final = 0;
     for (int i = 0; i < SensorCount; i++) {
-        s_depois[i] = sensorVePreto(i);
-        if (s_depois[i]) contPretos_depois++;
+        s_final[i] = sensorVePreto(i);
+        if (s_final[i]) contPretos_final++;
     }
 
-    bool frente_depois = s_depois[S_CENTRAL_ESQUERDO] && s_depois[S_CENTRAL_MEIO] && s_depois[S_CENTRAL_DIREITO];
-    bool esquerda_depois = s_depois[S_ESQUERDO_EXTREMO] || s_depois[S_ESQUERDO_INTERNO];
-    bool direita_depois = s_depois[S_DIREITO_EXTREMO] || s_depois[S_DIREITO_INTERNO];
+    // Recalcula 'frente_final' com base na leitura atual
+    bool frente_final = sensorVePreto(S_CENTRAL_MEIO) || 
+                        (sensorVePreto(S_CENTRAL_ESQUERDO) || sensorVePreto(S_CENTRAL_DIREITO));
 
-    broadcastSerialLn("[ConfirmNode] Pós-Avanço: F=" + String(frente_depois) + " E=" + String(esquerda_depois) + " D=" + String(direita_depois) + " Pretos=" + String(contPretos_depois));
+    // Logs para depuração (você já tem o de Pós-Avanço)
+    // broadcastSerialLn("LeituraSensores em classificarNoAposAvanco: s2=" + String(sensorValues[S_CENTRAL_ESQUERDO]) + " s3=" + String(sensorValues[S_CENTRAL_MEIO]) + " s4=" + String(sensorValues[S_CENTRAL_DIREITO]));
 
-    // --- Lógica de Decisão Final ---
-    // Exemplo para o caso que era PADRAO_LATERAL_DIREITA_FORTE ou AMBIGUO (tendendo a direita)
-    if (padraoAntesDoAvanco == PADRAO_LATERAL_DIREITA_FORTE || 
-        (padraoAntesDoAvanco == PADRAO_AMBIGUO && direita_depois) ) { // Se o padrão inicial sugeria direita
+    // --- Lógica de Decisão Final ATUALIZADA ---
 
-        if (!frente_depois && direita_depois && !esquerda_depois) {
-            // Linha em frente sumiu, só tem direita forte
-            ultimoNoClassificado = NO_FINAL_CURVA_90_DIR;
-        } else if (frente_depois && direita_depois && !esquerda_depois) {
-            ultimoNoClassificado = NO_FINAL_T_COM_FRENTE_DIR;
-        } else if (frente_depois && direita_depois && esquerda_depois) {
-            ultimoNoClassificado = NO_FINAL_CRUZAMENTO;
-        } else if (!frente_depois && direita_depois && esquerda_depois) {
-            ultimoNoClassificado = NO_FINAL_T_SEM_FRENTE; // Estava no pé do T e confirmou
-        } else if (!frente_depois && !direita_depois && !esquerda_depois && contPretos_depois <=1) {
-            // Tudo sumiu após o avanço -> provavelmente um beco ou overshot
-            ultimoNoClassificado = NO_FINAL_BECO_SEM_SAIDA; // Ou um tipo de erro
-        }
-         else { // Não conseguiu classificar claramente, talvez continuar reto se houver frente?
-            if(frente_depois) {
-                ultimoNoClassificado = NO_FINAL_RETA_SIMPLES; // Ou um T_COM_FRENTE_DIR se a direita ainda estiver lá
-                 if (direita_depois) ultimoNoClassificado = NO_FINAL_T_COM_FRENTE_DIR;
-                 else if (esquerda_depois) ultimoNoClassificado = NO_FINAL_T_COM_FRENTE_ESQ; // Improvável se o erro era para direita
-            } else {
-                broadcastSerialLn("[ConfirmNode] Classificação DIREITA incerta pós-avanço.");
-                ultimoNoClassificado = NO_FINAL_NAO_E; // Ou um tipo de erro específico
-            }
-        }
+    // 1. CHECAR SE É O FIM DO LABIRINTO (PRIORIDADE MÁXIMA)
+    if (padraoDetectadoAntesDoAvanco == PADRAO_MUITOS_SENSORES_PRETOS && 
+        contPretos_final >= (SensorCount - 1) ) { // Ex: 6 ou 7 dos 7 sensores ainda estão pretos
+        ultimoNoClassificado = NO_FINAL_FIM_DO_LABIRINTO;
     } 
-    // Adicionar lógica similar para PADRAO_LATERAL_ESQUERDA_FORTE e outros PADRAO_AMBIGUO
-    else if (padraoAntesDoAvanco == PADRAO_LATERAL_ESQUERDA_FORTE ||
-             (padraoAntesDoAvanco == PADRAO_AMBIGUO && esquerda_depois)) {
-        if (!frente_depois && esquerda_depois && !direita_depois) {
-            ultimoNoClassificado = NO_FINAL_CURVA_90_ESQ;
-        } else if (frente_depois && esquerda_depois && !direita_depois) {
-            ultimoNoClassificado = NO_FINAL_T_COM_FRENTE_ESQ;
-        } else if (frente_depois && direita_depois && esquerda_depois) {
-            ultimoNoClassificado = NO_FINAL_CRUZAMENTO;
-        } else if (!frente_depois && direita_depois && esquerda_depois) {
-            ultimoNoClassificado = NO_FINAL_T_SEM_FRENTE;
-        } else if (!frente_depois && !direita_depois && !esquerda_depois && contPretos_depois <=1) {
-            ultimoNoClassificado = NO_FINAL_BECO_SEM_SAIDA;
-        } else {
-             if(frente_depois) {
-                ultimoNoClassificado = NO_FINAL_RETA_SIMPLES;
-                if (esquerda_depois) ultimoNoClassificado = NO_FINAL_T_COM_FRENTE_ESQ;
-                else if (direita_depois) ultimoNoClassificado = NO_FINAL_T_COM_FRENTE_DIR;
+    // 2. LÓGICA EXISTENTE PARA OUTROS TIPOS DE NÓS (agora dentro de 'else if')
+    //    Esta lógica usará 'frente_final' (calculado acima com base na leitura atual)
+    //    e 'lateralEsquerdaEncontradaBusca' / 'lateralDireitaEncontradaBusca' (definidas na fase de busca lateral)
+    else if (frente_final) { // Usa a 'frente_final' recalculada aqui
+        if (lateralEsquerdaEncontradaBusca && lateralDireitaEncontradaBusca) ultimoNoClassificado = NO_FINAL_CRUZAMENTO;
+        else if (lateralEsquerdaEncontradaBusca) ultimoNoClassificado = NO_FINAL_T_COM_FRENTE_ESQ;
+        else if (lateralDireitaEncontradaBusca) ultimoNoClassificado = NO_FINAL_T_COM_FRENTE_DIR;
+        else ultimoNoClassificado = NO_FINAL_RETA_SIMPLES; 
+    } else { // Sem caminho em frente claro
+        if (lateralEsquerdaEncontradaBusca && lateralDireitaEncontradaBusca) ultimoNoClassificado = NO_FINAL_T_SEM_FRENTE;
+        else if (lateralEsquerdaEncontradaBusca) ultimoNoClassificado = NO_FINAL_CURVA_90_ESQ;
+        else if (lateralDireitaEncontradaBusca) ultimoNoClassificado = NO_FINAL_CURVA_90_DIR;
+        else { // Nenhuma lateral e nenhuma frente
+            // Se o padrão inicial já indicava quase tudo branco, ou se agora está tudo branco
+            if (padraoDetectadoAntesDoAvanco == PADRAO_QUASE_TUDO_BRANCO || contPretos_final <= 1) {
+                 ultimoNoClassificado = NO_FINAL_BECO_SEM_SAIDA;
             } else {
-                broadcastSerialLn("[ConfirmNode] Classificação ESQUERDA incerta pós-avanço.");
-                ultimoNoClassificado = NO_FINAL_NAO_E;
+                 broadcastSerialLn("[ClassificaFinal] Situação indefinida. Padrão inicial: " + String(padraoDetectadoAntesDoAvanco));
+                 ultimoNoClassificado = NO_FINAL_NAO_E; // Ou um tipo de erro/perda
             }
         }
     }
-    else if (padraoAntesDoAvanco == PADRAO_MUITOS_SENSORES_PRETOS || 
-             (padraoAntesDoAvanco == PADRAO_AMBIGUO && frente_depois) ) { // Estava numa área preta grande
-        if (frente_depois && esquerda_depois && direita_depois) ultimoNoClassificado = NO_FINAL_CRUZAMENTO;
-        else if (frente_depois && esquerda_depois) ultimoNoClassificado = NO_FINAL_T_COM_FRENTE_ESQ;
-        else if (frente_depois && direita_depois) ultimoNoClassificado = NO_FINAL_T_COM_FRENTE_DIR;
-        else if (!frente_depois && esquerda_depois && direita_depois) ultimoNoClassificado = NO_FINAL_T_SEM_FRENTE;
-        else if (frente_depois) ultimoNoClassificado = NO_FINAL_RETA_SIMPLES; // Ou um T mal detectado
-        else {
-            broadcastSerialLn("[ConfirmNode] Classificação ÁREA PRETA incerta pós-avanço.");
-            ultimoNoClassificado = NO_FINAL_NAO_E; // Ou um tipo de erro específico
-        }
-    } else {
-        broadcastSerialLn("[ConfirmNode] Padrão inicial não tratado para reclassificação: " + String(padraoAntesDoAvanco));
-        ultimoNoClassificado = NO_FINAL_NAO_E;
-    }
+
+    // Atualiza o log da decisão com o 'ultimoNoClassificado' definido acima
+    broadcastSerialLn("[ClassificaFinal] Dados para classificar: EsqP1=" + String(lateralEsquerdaEncontradaBusca) + 
+                                  " | DirP1=" + String(lateralDireitaEncontradaBusca) + 
+                                  " | FreAgora=" + String(frente_final) + // Usando a frente recalculada
+                                  " | PadrãoInicial=" + String(padraoDetectadoAntesDoAvanco) );
+    // ... (Seu log de LeituraSensores dos valores brutos dos sensores centrais) ...
+    broadcastSerialLn("LeituraSensores: s3: " + String(sensorValues[2]) + " s4: " + String(sensorValues[3]) + "s5: " + String(sensorValues[4]));
 
 
+    // --- Transição de Estado Final --- (Esta parte do código parece boa)
     if (ultimoNoClassificado == NO_FINAL_NAO_E || ultimoNoClassificado == NO_FINAL_RETA_SIMPLES) {
-        estadoRoboAtual = SEGUINDO_LINHA_WEB; // Volta a seguir linha se não for um nó conclusivo
-        broadcastSerialLn("[ConfirmNode] Decisão: Não é um nó definitivo ou é reta. Retomando seguimento de linha.");
+        estadoRoboAtual = SEGUINDO_LINHA_WEB; 
+        broadcastSerialLn("[ClassificaFinal] Decisão: Não é nó para parar / Reta. Retomando seguimento.");
     } else {
-        estadoRoboAtual = EM_NO_WEB; // Nó classificado, para para processamento do grafo
-        broadcastSerialLn("[ConfirmNode] Decisão Final do Nó: " + nomeDoNo(ultimoNoClassificado));
+        estadoRoboAtual = EM_NO_WEB; 
+        // A mensagem "Decisão Final do Nó: ..." será impressa ao entrar no case EM_NO_WEB
     }
 }
 
@@ -719,6 +718,142 @@ void executarCalibracaoLinhaWebService() {
     estadoRoboAtual = PARADO_WEB; // Define o estado após a calibração
 }
 
+bool virar_direita_90_preciso() {
+    broadcastSerialLn("[Virada] Iniciando: 90 graus DIREITA (precisão)...");
+    pararMotoresWebService();
+    delay(100); 
+
+    motor('e', 'f', VELOCIDADE_ROTACAO_PRECISA); // Motor esquerdo para frente
+    motor('d', 't', VELOCIDADE_ROTACAO_PRECISA); // Motor direito para trás
+
+    unsigned long inicioTimerVirada = millis();
+    bool linhaAlvoAlinhada = false;
+
+    while (millis() - inicioTimerVirada < TIMEOUT_VIRADA_90_MS) {
+        lerSens(); // Atualiza sensorValues e posicaoPID_3sensores
+
+        // Condição para parar:
+        // 1. Já passou um tempo mínimo para garantir que saiu da linha original.
+        // 2. A 'posicaoPID_3sensores' está próxima do centro (setPoint_PID_3sensores = 1000).
+        // 3. O sensor central do meio (S_CENTRAL_MEIO) está de fato vendo preto.
+        if (millis() - inicioTimerVirada > TEMPO_MINIMO_PARA_SAIR_DA_LINHA_MS) {
+            if (abs(posicaoPID_3sensores - setPoint_PID_3sensores) < LIMIAR_ALINHAMENTO_VIRADA &&
+                sensorVePreto(S_CENTRAL_MEIO)) {
+                linhaAlvoAlinhada = true;
+                broadcastSerialLn("[Virada] Linha alvo encontrada e alinhada (DIR).");
+                break; 
+            }
+        }
+        delay(10); // Pequeno delay para não sobrecarregar e permitir leituras
+    }
+
+    pararMotoresWebService();
+
+    if (linhaAlvoAlinhada) {
+        broadcastSerialLn("[Virada] DIREITA 90 graus concluída com sucesso.");
+        // Opcional: pequeno avanço para "travar" na linha
+        motor('a', 'f', VELOCIDADE_AJUSTE_FINAL);
+        delay(TEMPO_AJUSTE_FINAL_MS);
+        pararMotoresWebService();
+        return true;
+    } else {
+        broadcastSerialLn("[Virada] ERRO: Timeout ou falha ao alinhar na virada DIREITA.");
+        // Tentar parar sobre qualquer coisa que pareça linha, se possível, ou apenas parar.
+        // Se contSensoresPretos > 0 após o timeout, pode ser um pequeno ajuste.
+        // Por enquanto, apenas reporta falha.
+        return false;
+    }
+}
+bool virar_esquerda_90_preciso() {
+    broadcastSerialLn("[Virada] Iniciando: 90 graus ESQUERDA (precisão)...");
+    pararMotoresWebService();
+    delay(100);
+
+    motor('e', 't', VELOCIDADE_ROTACAO_PRECISA); // Motor esquerdo para trás
+    motor('d', 'f', VELOCIDADE_ROTACAO_PRECISA); // Motor direito para frente
+
+    unsigned long inicioTimerVirada = millis();
+    bool linhaAlvoAlinhada = false;
+
+    while (millis() - inicioTimerVirada < TIMEOUT_VIRADA_90_MS) {
+        lerSens();
+
+        if (millis() - inicioTimerVirada > TEMPO_MINIMO_PARA_SAIR_DA_LINHA_MS) {
+            if (abs(posicaoPID_3sensores - setPoint_PID_3sensores) < LIMIAR_ALINHAMENTO_VIRADA &&
+                sensorVePreto(S_CENTRAL_MEIO)) {
+                linhaAlvoAlinhada = true;
+                broadcastSerialLn("[Virada] Linha alvo encontrada e alinhada (ESQ).");
+                break; 
+            }
+        }
+        delay(10); 
+    }
+
+    pararMotoresWebService();
+
+    if (linhaAlvoAlinhada) {
+        broadcastSerialLn("[Virada] ESQUERDA 90 graus concluída com sucesso.");
+        motor('a', 'f', VELOCIDADE_AJUSTE_FINAL);
+        delay(TEMPO_AJUSTE_FINAL_MS);
+        pararMotoresWebService();
+        return true;
+    } else {
+        broadcastSerialLn("[Virada] ERRO: Timeout ou falha ao alinhar na virada ESQUERDA.");
+        return false;
+    }
+}
+bool virar_180_preciso() {
+    broadcastSerialLn("[Virada] Iniciando: 180 graus (Meia Volta)...");
+    pararMotoresWebService();
+    delay(100);
+
+    // Escolha uma direção de rotação (ex: virar como se fosse para a direita por mais tempo)
+    motor('e', 'f', VELOCIDADE_ROTACAO_PRECISA); 
+    motor('d', 't', VELOCIDADE_ROTACAO_PRECISA); 
+
+    unsigned long inicioTimerVirada = millis();
+    bool linhaAlvoAlinhada = false;
+    
+    // Para 180, o tempo mínimo para sair da linha precisa ser maior, 
+    // para passar dos ~90 graus antes de começar a procurar ativamente.
+    // Vamos usar TEMPO_MINIMO_VIRADA_90_MS * 1.8 (aproximadamente)
+    // ou uma constante própria como TEMPO_MINIMO_VIRADA_180_MS.
+    // Por simplicidade, vamos aumentar o tempo total e manter o TEMPO_MINIMO_PARA_SAIR_DA_LINHA_MS.
+    // A ideia é que ele vai girar, perder a linha, e depois encontrá-la novamente.
+
+    while (millis() - inicioTimerVirada < TIMEOUT_VIRADA_180_MS) {
+        lerSens();
+
+        // Para 180 graus, esperamos que ele passe da linha, perca-a completamente
+        // e depois a encontre novamente. A condição de "tempo mínimo" aqui é mais
+        // para garantir que ele não pare prematuramente na linha original se o giro for lento.
+        // Um tempo mínimo maior antes de aceitar o alinhamento pode ser útil.
+        // Vamos usar TEMPO_MINIMO_PARA_SAIR_DA_LINHA_MS * 2 como estimativa para passar do ponto original.
+        if (millis() - inicioTimerVirada > (TEMPO_MINIMO_PARA_SAIR_DA_LINHA_MS * 3) ) { // Aumentado para 180
+            if (abs(posicaoPID_3sensores - setPoint_PID_3sensores) < LIMIAR_ALINHAMENTO_VIRADA &&
+                sensorVePreto(S_CENTRAL_MEIO)) {
+                linhaAlvoAlinhada = true;
+                broadcastSerialLn("[Virada] Linha alvo encontrada e alinhada (180).");
+                break; 
+            }
+        }
+        delay(10); 
+    }
+
+    pararMotoresWebService();
+
+    if (linhaAlvoAlinhada) {
+        broadcastSerialLn("[Virada] 180 graus (Meia Volta) concluída com sucesso.");
+        motor('a', 'f', VELOCIDADE_AJUSTE_FINAL);
+        delay(TEMPO_AJUSTE_FINAL_MS);
+        pararMotoresWebService();
+        return true;
+    } else {
+        broadcastSerialLn("[Virada] ERRO: Timeout ou falha ao alinhar na virada 180.");
+        return false;
+    }
+}
+
 // --- SETUP ---
 void setup() {
     Serial.begin(115200);
@@ -839,7 +974,8 @@ void loop()
     webSocketServer.loop();    
 
     switch (estadoRoboAtual) {
-        case PARADO_WEB: 
+        case PARADO_WEB:
+            pararMotoresWebService(); 
             // Nenhuma variável local inicializada aqui que cause problema
             break; 
 
@@ -903,6 +1039,19 @@ void loop()
                 delay(TEMPO_LEITURA_ESTAVEL_MS);
                 lerSens();
 
+                // --- DEBUG DETALHADO AQUI ---
+                bool sCE = sensorVePreto(S_CENTRAL_ESQUERDO); // sensorValues[2]
+                bool sCM = sensorVePreto(S_CENTRAL_MEIO);     // sensorValues[3]
+                bool sCD = sensorVePreto(S_CENTRAL_DIREITO);  // sensorValues[4]
+
+                broadcastSerialLn("[DEBUG ChecaFrente] Valores Brutos Centrais: S2=" + String(sensorValues[S_CENTRAL_ESQUERDO]) + 
+                                                                " S3=" + String(sensorValues[S_CENTRAL_MEIO]) + 
+                                                                " S4=" + String(sensorValues[S_CENTRAL_DIREITO]));
+                broadcastSerialLn("[DEBUG ChecaFrente] sensorVePreto Resultados: sCE=" + String(sCE) + 
+                                                                        " sCM=" + String(sCM) + 
+                                                                        " sCD=" + String(sCD));
+                // --- FIM DO DEBUG DETALHADO ---
+
                 // Checa caminho à frente (sensores centrais do PID: 2, 3, 4)
                 // Uma condição mais robusta: pelo menos o central E um dos vizinhos, ou todos os 3
                 if (sensorVePreto(S_CENTRAL_MEIO) || 
@@ -946,11 +1095,123 @@ void loop()
         case PAUSADO_WEB: 
             // Nenhuma variável local inicializada aqui que cause problema
             break;
-        case EM_NO_WEB:
-            // A mensagem já foi impressa na transição para este estado
-            break;
-        case CALIBRANDO_LINHA_WEB: 
-            // Nenhuma variável local inicializada aqui que cause problema
+         case EM_NO_WEB:
+            {
+            // A mensagem "Decisão Final do Nó: ..." já foi impressa.
+            // Este é o ponto onde o robô PAROU e CLASSIFICOU um nó.
+
+            // 1. ATUALIZAR INFORMAÇÕES DO NÓ ATUAL E ANTERIOR
+            // Só registra se o nó for "real" e não um erro ou simples reta que não deveria ter parado aqui.
+            // E também não registra se for o FIM, pois a exploração para.
+            if (ultimoNoClassificado != NO_FINAL_NAO_E && 
+                ultimoNoClassificado != NO_FINAL_RETA_SIMPLES &&
+                ultimoNoClassificado != NO_FINAL_FIM_DO_LABIRINTO) { // Não registra o "FIM" como um nó do qual se parte
+                
+                idNoAnterior = idNoAtual; 
+                idNoAtual = idProximoNo++;  
+
+                broadcastSerialLn("[Grafo] Nó Descoberto! ID Atual: " + String(idNoAtual) + 
+                                  ", Tipo: " + nomeDoNo(ultimoNoClassificado) + 
+                                  ". Veio do Nó ID: " + String(idNoAnterior));
+
+                String msgNode = "newNode:" + String(idNoAtual) + ":" + nomeDoNo(ultimoNoClassificado) + "_ID" + String(idNoAtual);
+                webSocketServer.broadcastTXT(msgNode);
+
+                if (!primeiroNo && idNoAnterior != -1) { 
+                    String msgEdge = "newEdge:" + String(idNoAnterior) + ":" + String(idNoAtual) + ":Segue";
+                    webSocketServer.broadcastTXT(msgEdge);
+                }
+                primeiroNo = false; 
+            } else if (ultimoNoClassificado == NO_FINAL_FIM_DO_LABIRINTO && primeiroNo) {
+                // Caso especial: Se o PRIMEIRO nó encontrado já é o fim.
+                idNoAnterior = -1; // Não há nó anterior válido para a aresta inicial
+                idNoAtual = idProximoNo++;
+                broadcastSerialLn("[Grafo] Nó Descoberto! ID Atual: " + String(idNoAtual) + 
+                                  ", Tipo: " + nomeDoNo(ultimoNoClassificado) + 
+                                  ". (É o FIM e o primeiro nó)");
+                String msgNode = "newNode:" + String(idNoAtual) + ":" + nomeDoNo(ultimoNoClassificado) + "_ID" + String(idNoAtual);
+                webSocketServer.broadcastTXT(msgNode);
+                primeiroNo = false; 
+            } else if (ultimoNoClassificado == NO_FINAL_FIM_DO_LABIRINTO && idNoAnterior != -1) {
+                 // Se o FIM é encontrado e não é o primeiro nó (ou seja, veio de algum lugar)
+                 // Registra o nó do FIM e a aresta até ele.
+                idNoAnterior = idNoAtual; // O nó que ele estava antes de chegar ao FIM
+                idNoAtual = idProximoNo++;  // ID para o nó FIM
+                broadcastSerialLn("[Grafo] Nó Descoberto! ID Atual: " + String(idNoAtual) + 
+                                  ", Tipo: " + nomeDoNo(ultimoNoClassificado) + 
+                                  ". Veio do Nó ID: " + String(idNoAnterior));
+                String msgNode = "newNode:" + String(idNoAtual) + ":" + nomeDoNo(ultimoNoClassificado) + "_ID" + String(idNoAtual);
+                webSocketServer.broadcastTXT(msgNode);
+                String msgEdge = "newEdge:" + String(idNoAnterior) + ":" + String(idNoAtual) + ":ChegouAoFim";
+                webSocketServer.broadcastTXT(msgEdge);
+                primeiroNo = false;
+            }
+
+            // 3. LÓGICA DE DECISÃO DE EXPLORAÇÃO (DFS MUITO SIMPLES - REGRA DA MÃO ESQUERDA)
+            // Prioridade: Esquerda, Frente, Direita, Ré.
+            // Isso é uma simplificação. Um DFS real precisaria marcar caminhos já explorados A PARTIR deste nó.
+            bool manobraExecutada = false;
+            
+             // --- ADICIONAR CHECAGEM PRIORITÁRIA PARA FIM_DO_LABIRINTO ---
+            if (ultimoNoClassificado == NO_FINAL_FIM_DO_LABIRINTO) {
+                broadcastSerialLn("[AcaoNo] FIM DO LABIRINTO ALCANÇADO! Exploração interrompida.");
+                pararMotoresWebService(); 
+                // Não executa manobra de virada, não volta a seguir linha.
+                // O robô pode mudar para PARADO_WEB ou um estado específico de "FIM_ENCONTRADO".
+                // Para o Dijkstra depois, este 'idNoAtual' será o nó de destino.
+                estadoRoboAtual = PARADO_WEB; // Para a exploração.
+                manobraExecutada = true; // Consideramos que a "ação" (parar) foi concluída.
+            }
+            // --- FIM DA CHECAGEM DE FIM_DO_LABIRINTO ---
+            else if (ultimoNoClassificado == NO_FINAL_BECO_SEM_SAIDA) {
+                broadcastSerialLn("[DFS] Beco sem saída. Dando meia volta...");
+                manobraExecutada = virar_180_preciso();
+            } 
+            else if (ultimoNoClassificado == NO_FINAL_CURVA_90_ESQ ||
+                       ultimoNoClassificado == NO_FINAL_T_COM_FRENTE_ESQ ||
+                       ultimoNoClassificado == NO_FINAL_T_SEM_FRENTE || 
+                       ultimoNoClassificado == NO_FINAL_CRUZAMENTO) {
+                // Lógica de priorizar esquerda para DFS simplificado
+                broadcastSerialLn("[DFS] Opção à Esquerda disponível/priorizada. Virando à ESQUERDA.");
+                manobraExecutada = virar_esquerda_90_preciso();
+            } 
+            else if (ultimoNoClassificado == NO_FINAL_T_COM_FRENTE_DIR) { 
+                // Se não caiu na prioridade da esquerda, e é um T com frente e direita, testa direita
+                broadcastSerialLn("[DFS] Opção Frente e Direita. TESTE: Virando à DIREITA.");
+                manobraExecutada = virar_direita_90_preciso();
+            } 
+            else if (ultimoNoClassificado == NO_FINAL_RETA_SIMPLES) {  
+                broadcastSerialLn("[DFS] Reta simples detectada pós-confirmação. Seguindo em FRENTE.");
+                motor('a', 'f', VELOCIDADE_AJUSTE_FINAL); delay(TEMPO_AJUSTE_FINAL_MS); pararMotoresWebService();
+                manobraExecutada = true; 
+            } 
+            else if (ultimoNoClassificado == NO_FINAL_CURVA_90_DIR) {
+                broadcastSerialLn("[DFS] Curva de 90 Direita. Virando à DIREITA.");
+                manobraExecutada = virar_direita_90_preciso();
+            }
+            else { // NO_FINAL_NAO_E ou default não tratado explicitamente acima
+                broadcastSerialLn("[DFS] Nenhuma regra de exploração clara para " + nomeDoNo(ultimoNoClassificado) + ". Parando ou voltando.");
+                // Poderia ser uma meia volta como fallback se for um tipo de nó inesperado
+                // ou se for NO_FINAL_NAO_E (que não deveria acontecer se classificarNoAposAvanco for robusto)
+                if (ultimoNoClassificado == NO_FINAL_NAO_E) {
+                    manobraExecutada = false; // Indica falha em classificar, leva à parada
+                } else {
+                    manobraExecutada = virar_180_preciso(); // Fallback para outros tipos de nós não listados
+                }
+            }
+
+            // 4. DECIDIR PRÓXIMO ESTADO GERAL
+            if (manobraExecutada) {
+                // Se o estado já foi definido para PARADO_WEB (como no caso do FIM_DO_LABIRINTO), não muda.
+                if (estadoRoboAtual != PARADO_WEB) { 
+                    broadcastSerialLn("[DFS] Manobra de exploração ("+ nomeDoNo(ultimoNoClassificado) +") bem-sucedida. Retomando seguimento de linha...");
+                    estadoRoboAtual = INICIANDO_EXPLORACAO_WEB; 
+                }
+            } else {
+                broadcastSerialLn("[DFS] ERRO na manobra ("+ nomeDoNo(ultimoNoClassificado) +") ou manobra não definida. Robô PARADO.");
+                estadoRoboAtual = PARADO_WEB; 
+            }
+        } // Fim do escopo do case EM_NO_WEB
             break; 
         default:
             // Nenhuma variável local inicializada aqui que cause problema
