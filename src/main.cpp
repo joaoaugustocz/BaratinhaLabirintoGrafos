@@ -1,9 +1,6 @@
 #include <Arduino.h>
 #include <FastLED.h>
-#include <MPU6050_tockn.h>
-#include <Wire.h>
 #include <QTRSensors.h>
-#include <EEPROM.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <WebSocketsServer.h> // Para WebSockets
@@ -50,37 +47,55 @@ enum TipoDeNoFinal {
 // Variável global para armazenar o tipo de nó após confirmação
 TipoDeNoFinal ultimoNoClassificado = NO_FINAL_NAO_E;
 
-// Variáveis para o processo de confirmação
-bool precisaConfirmarNo = false;
-unsigned long inicioMovimentoConfirmacao = 0;
-const int DURACAO_MOV_CONFIRMACAO_MS = 400; // Avançar por 200ms (ajuste!)
-const int VELOCIDADE_CONFIRMACAO = 30;     // Velocidade baixa para avançar (ajuste!)
-TipoDePadraoSensor padraoInicialDetectado;
 
-
-
-
-enum TipoDeNo {
-  NAO_E_NO,
-  BECO_SEM_SAIDA,
-  CURVA_ESQUERDA_90,
-  CURVA_DIREITA_90,
-  INTERSECAO // Para T, Cruz (+), ou qualquer situação com múltiplas opções de caminho
-};
 
 // === ESTADOS DO ROBÔ PARA CONTROLE WEB ===
 enum EstadoRobo {
   PARADO_WEB,
   INICIANDO_EXPLORACAO_WEB,
   SEGUINDO_LINHA_WEB,
+  
+  PREPARANDO_ANALISE_NO,      // Robô parou, vai iniciar análise
+  AVANCO_POSICIONAMENTO_NO,   // Primeiro avanço curto
+  AVANCO_CHECA_FRENTE_NO,     // Segundo avanço para checar frente
+  CLASSIFICACAO_DETALHADA_NO, // Estado para classificar após os avanços
+  
   PAUSADO_WEB,
-  EM_NO_WEB,
-  CALIBRANDO_LINHA_WEB,
-  CONFIRMANDO_NO_AVANCA, 
-  REAVALIANDO_NO_POS_AVANCO
+  EM_NO_WEB, 
+  CALIBRANDO_LINHA_WEB
+  // Remova NODE_DETECTADO_PARANDO, AVANCANDO_BUSCA_LATERAL, AVANCANDO_CHECA_FRENTE, CLASSIFICACAO_FINAL_NO se eram os antigos
 };
+
+// Variáveis Globais para a análise do nó
+bool achouEsquerdaNoPonto1 = false;
+bool achouDireitaNoPonto1 = false;
+bool achouFrenteNoPonto2 = false; 
+
+
 EstadoRobo estadoRoboAtual = PARADO_WEB;
 bool exploracaoWebIniciada = false;
+
+bool lateralEsquerdaEncontradaBusca = false;
+bool lateralDireitaEncontradaBusca = false;
+unsigned long inicioAvanco = 0; // Timer genérico para os avanços
+
+// unsigned long inicioAvanco; // Já existe
+// const int VELOCIDADE_AVANCO_CONFIRM = 40; // Já existe, podemos renomear ou usar esta
+
+const int TEMPO_POSICIONAMENTO_NO_MS = 80;   // Ajuste este valor (3pi usa 50ms a vel 50)
+const int VELOCIDADE_POSICIONAMENTO = 40;   // Ajuste este valor
+
+const int TEMPO_CHECA_FRENTE_NO_MS = 150; // Ajuste este valor (3pi usa 200ms a vel 40)
+const int VELOCIDADE_CHECA_FRENTE = 35;    // Ajuste este valor
+
+const int TEMPO_LEITURA_ESTAVEL_MS = 50; // Pequeno delay para estabilizar leitura após parar
+
+
+// Constantes de tempo/velocidade para os avanços de confirmação (AJUSTE ESTES VALORES!)
+const int DURACAO_BUSCA_LATERAL_MS = 600;     // Max tempo para achar uma lateral
+const int DURACAO_AVANCO_FRENTE_MS = 200;     // Tempo para avançar e checar a frente
+const int VELOCIDADE_AVANCO_CONFIRM = 40;   // Velocidade para os avanços
+
 
 //--------------------------- Motores (Suas Definições)
 #define in1 GPIO_NUM_39 // Motor Esquerdo Dir1
@@ -150,26 +165,12 @@ const uint16_t setPoint_PID_3sensores = 1000; // Novo setPoint ( (3-1)*1000 / 2 
 #define S_DIREITO_INTERNO  5 // s6
 #define S_DIREITO_EXTREMO  6 // s7
 
-//--------------------------- MPU6050 (Suas Variáveis)
-const int MPU_ADDR = 0x68;
-int16_t gyroX_raw, gyroY_raw, gyroZ_raw, accX_raw, accY_raw, accZ_raw; // Renomeado para _raw
-float angleX = 0, angleY = 0, angleZ = 0;
-float gyroRateX, gyroRateY, gyroRateZ;
-float accAngleX, accAngleY;
-float elapsedTime_mpu; // Renomeado
-unsigned long currentTime_mpu, previousTime_mpu; // Renomeado
-float accAngleCorrectionFactor = 0.98;
-float gyroXOffset = 0, gyroYOffset = 0, gyroZOffset = 0;
-int calibracoes_mpu = 1000; 
-const int EEPROM_OFFSET_ADDR = 0;
-float gyroScaleFactor;
-float gyroScaleFactors[] = {131.0, 65.5, 32.8, 16.4};
 
 //--------------------------- Sensores Linha (Suas Definições)
 QTRSensors qtr;
 const uint8_t SensorCount = 7;
 uint16_t sensorValues[SensorCount];
-#define tempoCalibracaoLinha 240 
+#define tempoCalibracaoLinha 120 
 
 #define s1 GPIO_NUM_1
 #define s2 GPIO_NUM_2
@@ -191,11 +192,9 @@ CRGB leds[NUM_LEDS];
 
 // --- Protótipos ---
 void setColor(char sensor, int h, int s, int v);
-void configurarEscalaGiroscopio();
-void calibrarGiroscopio();
-void salvarCalibracaoEEPROM(); // Renomeado para clareza
-bool carregarCalibracaoEEPROM(); // Renomeado para clareza
-float getAngleMPU(char eixo); // Renomeado para clareza
+
+
+
 void lerSens();
 void motorE_PWM(int vel);
 void motorD_PWM(int vel);
@@ -203,7 +202,7 @@ void motor(char lado, char dir, int pwm);
 void pid_controlado_web();
 void executarCalibracaoLinhaWebService();
 void pararMotoresWebService();
-void pid_seguelinha_original(); // Sua função PID original, se quiser usá-la
+
 
 void broadcastSerial(const String &message) { 
     Serial.print(message);
@@ -306,64 +305,43 @@ TipoDePadraoSensor detectarPadraoSensores() {
     bool s[SensorCount];
     int contSensoresPretos = 0;
     for (int i = 0; i < SensorCount; i++) {
-        s[i] = sensorVePreto(i); // true se preto
+        s[i] = sensorVePreto(i); 
         if (s[i]) contSensoresPretos++;
     }
 
     bool pid_frente_forte = s[S_CENTRAL_ESQUERDO] && s[S_CENTRAL_MEIO] && s[S_CENTRAL_DIREITO];
     bool pid_sem_linha_frente = sensorVeBranco(S_CENTRAL_ESQUERDO) && sensorVeBranco(S_CENTRAL_MEIO) && sensorVeBranco(S_CENTRAL_DIREITO);
-    
-    bool tem_saida_esquerda_forte = s[S_ESQUERDO_EXTREMO] && s[S_ESQUERDO_INTERNO];
-    // bool tem_saida_esquerda_parcial = s[S_ESQUERDO_EXTREMO] || s[S_ESQUERDO_INTERNO]; // Pode usar esta se a "forte" for muito restritiva
-    bool tem_saida_direita_forte = s[S_DIREITO_EXTREMO] && s[S_DIREITO_INTERNO];
-    // bool tem_saida_direita_parcial = s[S_DIREITO_EXTREMO] || s[S_DIREITO_INTERNO];
+    bool alguma_lateral_ativa = s[S_ESQUERDO_EXTREMO] || s[S_ESQUERDO_INTERNO] || s[S_DIREITO_EXTREMO] || s[S_DIREITO_INTERNO];
 
-
-    // 1. Quase tudo branco -> Provável Beco sem Saída ou perda total
-    if (contSensoresPretos <= 1 && pid_sem_linha_frente) {
-        return PADRAO_QUASE_TUDO_BRANCO;
+    if (pid_sem_linha_frente && contSensoresPretos <= 1) {
+        return PADRAO_QUASE_TUDO_BRANCO; // Provável Beco sem Saída
     }
 
-    // 2. Muitos sensores pretos -> Provável grande área de intersecção
-    if (contSensoresPretos >= (SensorCount - 1)) { // 6 ou 7 sensores pretos
-        return PADRAO_MUITOS_SENSORES_PRETOS;
-    }
-    
-    // 3. Linha em frente detectada pelos sensores do PID
-    if (pid_frente_forte) {
-        if (tem_saida_esquerda_forte || tem_saida_direita_forte) {
-             // Tem frente E tem pelo menos uma saída lateral forte
-             return PADRAO_AMBIGUO; // Pode ser T c/ frente, Cruzamento ou até início de curva se o robô está desalinhado
-        }
-        // Se tem frente forte e nenhuma saída lateral forte, é uma linha reta (ou curva suave)
-        if (abs(error) < 300) { // Erro do PID (3 sensores) baixo
-            return PADRAO_LINHA_RETA;
-        } else {
-            // Erro do PID alto, mas ainda vendo linha em frente -> pode ser curva suave ou desalinhamento
-            return PADRAO_LINHA_RETA; // Ou um PADRAO_CURVA_SUAVE se quiser distinguir
-        }
+    if (pid_frente_forte && !alguma_lateral_ativa && abs(error) < 400) { // Erro do PID 3 sensores
+        return PADRAO_LINHA_RETA; // Linha em frente clara, sem laterais, PID centrado
     }
 
-    // 4. Linha em frente NÃO detectada fortemente pelos 3 sensores centrais do PID
-    if (pid_sem_linha_frente || !s[S_CENTRAL_MEIO]) { // Se os centrais estão brancos ou o do meio não vê preto
-        if (tem_saida_esquerda_forte && tem_saida_direita_forte) {
-            return PADRAO_AMBIGUO; // Pode ser "pé" de T, ou um cruzamento onde a frente foi perdida momentaneamente
-        }
-        if (tem_saida_esquerda_forte) {
-            // Sem frente clara, mas esquerda forte. Provável curva de 90 esq ou T onde a frente foi perdida.
-            return PADRAO_LATERAL_ESQUERDA_FORTE; 
-        }
-        if (tem_saida_direita_forte) {
-            // Sem frente clara, mas direita forte. Provável curva de 90 dir ou T onde a frente foi perdida.
-            return PADRAO_LATERAL_DIREITA_FORTE;
-        }
+    // Qualquer outra situação (muitos sensores pretos, laterais ativas, erro PID grande com laterais)
+    // será tratada como um potencial nó que precisa de confirmação.
+    if (contSensoresPretos >= (SensorCount -1) ) return PADRAO_MUITOS_SENSORES_PRETOS; // Ex: 6 ou 7
+    if (alguma_lateral_ativa && pid_frente_forte) return PADRAO_AMBIGUO; // Frente + Lateral
+    if (alguma_lateral_ativa && !pid_frente_forte) { // Sem frente clara, mas com lateral
+        if (s[S_ESQUERDO_EXTREMO] || s[S_ESQUERDO_INTERNO]) return PADRAO_LATERAL_ESQUERDA_FORTE;
+        if (s[S_DIREITO_EXTREMO] || s[S_DIREITO_INTERNO]) return PADRAO_LATERAL_DIREITA_FORTE;
+    }
+    if (abs(error) > 700) { // Erro grande do PID de 3 sensores, linha perdida para um lado
+         if (error < 0 && (s[S_ESQUERDO_EXTREMO] || s[S_ESQUERDO_INTERNO])) return PADRAO_LATERAL_ESQUERDA_FORTE;
+         if (error > 0 && (s[S_DIREITO_EXTREMO] || s[S_DIREITO_INTERNO])) return PADRAO_LATERAL_DIREITA_FORTE;
     }
     
-    // Se o erro do PID (3 sensores) for muito grande, indica que a linha sumiu para um lado
-    if (error < -700) return PADRAO_LATERAL_ESQUERDA_FORTE; // Erro extremo p/ esquerda
-    if (error > 700)  return PADRAO_LATERAL_DIREITA_FORTE;  // Erro extremo p/ direita
+    // Se chegou aqui, mas não é uma linha reta clara, trata como ambíguo para o processo de confirmação
+    // ou pode ser que o PID ainda esteja corrigindo uma curva suave.
+    // Para forçar a checagem se não for uma linha reta perfeita:
+    if (! (pid_frente_forte && !alguma_lateral_ativa && abs(error) < 400) ) {
+        return PADRAO_AMBIGUO;
+    }
 
-    return PADRAO_LINHA_RETA; // Default se nada mais se encaixar
+    return PADRAO_LINHA_RETA; // Default
 }
 
 // --- Função Auxiliar para Converter Enum TipoDeNoFinal para String ---
@@ -382,65 +360,73 @@ String nomeDoNo(TipoDeNoFinal tipo) {
     }
 }
 
+
+bool checarEventoDeParada() {
+    // 'sensorValues' é o array global atualizado por lerSens() -> qtr.readCalibrated()
+    // S_CENTRAL_... e S_EXTREMO... são seus #defines para os índices dos sensores (0 a 6)
+
+    // Condição 1: Beco Sem Saída (inspirado no 3pi: sensors[1,2,3] < 100)
+    // Vamos checar se os 3 sensores centrais do PID estão vendo "branco".
+    bool frenteTotalmenteBrancaPID = sensorVeBranco(S_CENTRAL_ESQUERDO) &&
+                                   sensorVeBranco(S_CENTRAL_MEIO) &&
+                                   sensorVeBranco(S_CENTRAL_DIREITO);
+    
+    // Para ser mais robusto, podemos verificar se QUASE NENHUM sensor vê preto
+    int contSensoresPretos = 0;
+    for (int i = 0; i < SensorCount; i++) {
+        if (sensorVePreto(i)) {
+            contSensoresPretos++;
+        }
+    }
+
+    if (frenteTotalmenteBrancaPID && contSensoresPretos <= 1) { // Se os 3 centrais do PID estão brancos E no máximo 1 sensor no total vê preto
+        broadcastSerialLn("[EventoParada] Detectado: Provável BECO SEM SAÍDA (centrais PID brancos, <=1 preto total)");
+        return true; // Deve parar
+    }
+
+    // Condição 2: Intersecção/Ramificação Lateral (inspirado no 3pi: sensors[0] > 200 || sensors[4] > 200)
+    // Se o sensor MAIS EXTERNO da esquerda OU o MAIS EXTERNO da direita veem preto.
+    // Usamos S_ESQUERDO_EXTREMO (índice 0) e S_DIREITO_EXTREMO (índice 6)
+    if (sensorVePreto(S_ESQUERDO_EXTREMO) || sensorVePreto(S_DIREITO_EXTREMO)) {
+        // Para evitar paradas em curvas muito suaves onde um extremo pode tocar a linha brevemente
+        // enquanto o PID ainda está corrigindo, podemos adicionar uma condição de que o erro do PID
+        // não seja extremo ou que os sensores centrais ainda vejam um pouco da linha.
+        // Por enquanto, vamos manter simples como o 3pi: qualquer extremo ativo para.
+        // Depois podemos refinar se ele parar demais em curvas normais.
+        broadcastSerialLn("[EventoParada] Detectado: Provável INTERSECÇÃO/RAMIFICAÇÃO (sensor extremo ativo)");
+        return true; // Deve parar
+    }
+
+    return false; // Continuar seguindo a linha
+}
+
 void pid_controlado_web() {
     if (estadoRoboAtual != SEGUINDO_LINHA_WEB) return;
 
-    lerSens(); 
+    lerSens(); // Atualiza sensorValues e posicaoPID_3sensores
+
+    // Calcula o erro para o PID de 3 sensores
     second_lastError = lastError;
     lastError = error;
     error = posicaoPID_3sensores - setPoint_PID_3sensores; 
 
-    TipoDePadraoSensor padraoAtual = detectarPadraoSensores();
-
-    // --- LÓGICA DE TRANSIÇÃO DE ESTADO ---
-    if (padraoAtual == PADRAO_QUASE_TUDO_BRANCO) {
-        broadcastSerialLn("PADRAO_QUASE_TUDO_BRANCO detectado.");
+    // --- VERIFICA EVENTO DE PARADA ---
+    if (checarEventoDeParada()) {
         pararMotoresWebService();
-        ultimoNoClassificado = NO_FINAL_BECO_SEM_SAIDA;
-        broadcastSerialLn("Nó Classificado Direto: " + nomeDoNo(ultimoNoClassificado)); // MENSAGEM ÚNICA
-        estadoRoboAtual = EM_NO_WEB;
-        I_pid = 0;
-        return;
-    } else if (padraoAtual == PADRAO_LATERAL_ESQUERDA_FORTE && abs(error) > 700 && sensorVeBranco(S_DIREITO_EXTREMO)) { 
-        // Se erro do PID é grande e apenas um lado claramente ativo
-        // (condição mais forte para curva, evitando confusão com T)
-        broadcastSerialLn("PADRAO_LATERAL_ESQUERDA_FORTE (provável curva) detectado.");
-        pararMotoresWebService();
-        ultimoNoClassificado = NO_FINAL_CURVA_90_ESQ;
-        broadcastSerialLn("Nó Classificado Direto: " + nomeDoNo(ultimoNoClassificado)); // MENSAGEM ÚNICA
-        estadoRoboAtual = EM_NO_WEB;
-        I_pid = 0;
-        return;
-    } else if (padraoAtual == PADRAO_LATERAL_DIREITA_FORTE && abs(error) > 700 && sensorVeBranco(S_ESQUERDO_EXTREMO)) {
-        broadcastSerialLn("PADRAO_LATERAL_DIREITA_FORTE (provável curva) detectado.");
-        pararMotoresWebService();
-        ultimoNoClassificado = NO_FINAL_CURVA_90_DIR;
-        broadcastSerialLn("Nó Classificado Direto: " + nomeDoNo(ultimoNoClassificado)); // MENSAGEM ÚNICA
-        estadoRoboAtual = EM_NO_WEB;
-        I_pid = 0;
-        return;
-    } else if (padraoAtual == PADRAO_AMBIGUO || padraoAtual == PADRAO_MUITOS_SENSORES_PRETOS ||
-               (padraoAtual == PADRAO_LATERAL_DIREITA_FORTE && abs(error) <= 700) || // Lateral forte mas erro PID não tão extremo
-               (padraoAtual == PADRAO_LATERAL_ESQUERDA_FORTE && abs(error) <= 700) ) {
-        pararMotoresWebService(); // Para antes de avançar
-        broadcastSerialLn("Padrão AMBIGUO/INTERSECAO INICIAL detectado (" + String(padraoAtual) + "). Avançando para confirmar...");
-        padraoInicialDetectado = padraoAtual; // Guarda o padrão inicial
-        precisaConfirmarNo = true;
-        estadoRoboAtual = CONFIRMANDO_NO_AVANCA;
-        inicioMovimentoConfirmacao = millis();
-        motor('a', 'f', VELOCIDADE_CONFIRMACAO); // Inicia o movimento de avanço
-        I_pid = 0;
-        return;
+        I_pid = 0; // Reseta o integral do PID
+        estadoRoboAtual = PREPARANDO_ANALISE_NO; // Muda para o novo estado
+        // Não classificamos o nó final aqui ainda, isso virá depois da análise
+        return; 
     }
-    // Se for PADRAO_LINHA_RETA ou não se encaixar acima, continua PID
+    // --- FIM DA VERIFICAÇÃO DE EVENTO DE PARADA ---
     
-    // Lógica PID (como antes, mas sem a detecção de nó original)
+    // Se não houve evento de parada, continua com o PID normal para seguir linha:
     I_pid = I_pid + error;
-    I_pid = constrain(I_pid, -5000, 5000); // Ajuste este limite se necessário
+    I_pid = constrain(I_pid, -5000, 5000); 
     
     int motorSpeedCorrection = current_KP * error + current_KD * (error - lastError) + current_KI * I_pid;
     
-    int m1Speed_web, m2Speed_web;
+    int m1Speed_web, m2Speed_web; // Direito, Esquerdo
     if (abs(error) <= 100) { // Limiar para "reta" no PID de 3 sensores
         m1Speed_web = current_Mm1_reta - motorSpeedCorrection; 
         m2Speed_web = current_Mm2_reta + motorSpeedCorrection; 
@@ -737,7 +723,6 @@ void executarCalibracaoLinhaWebService() {
 void setup() {
     Serial.begin(115200);
     delay(1000);
-    EEPROM.begin(512);
 
     FastLED.addLeds<WS2812B, DATA_PIN, RGB>(leds, NUM_LEDS);
     LEDS.setBrightness(100); setColor('a', 0,0,0); FastLED.show();
@@ -833,19 +818,6 @@ void setup() {
     uint8_t pins_qtr_config[] = {s1, s2, s3, s4, s5, s6, s7}; // Array para QTR
     qtr.setTypeAnalog();
     qtr.setSensorPins(pins_qtr_config, SensorCount);
-    
-    Serial.println("Configurando MPU6050...");
-    broadcastSerialLn("Configurando MPU6050...");
-    
-    Wire.begin(GPIO_NUM_8, GPIO_NUM_9); // Pino I2C SDA, SCL - **VERIFIQUE OS SEUS PINOS!**
-    Wire.beginTransmission(MPU_ADDR); Wire.write(0x6B); Wire.write(0); Wire.endTransmission(true);
-    delay(100);
-    configurarEscalaGiroscopio();
-    if (!carregarCalibracaoEEPROM()) {
-        calibrarGiroscopio(); 
-        salvarCalibracaoEEPROM();
-    }
-    previousTime_mpu = micros();
 
     //Serial.println("Calibração inicial dos sensores de linha no setup...");
     //broadcastSerialLn("Calibração inicial dos sensores de linha no setup...");
@@ -858,61 +830,135 @@ void setup() {
     broadcastSerialLn("Robô Bartinha Finalizou o Setup!"); // Exemplo de uso
 }
 
+
+
 // --- LOOP PRINCIPAL ---
-void loop() {
+void loop() 
+{
     httpServer.handleClient(); 
     webSocketServer.loop();    
 
     switch (estadoRoboAtual) {
-        case PARADO_WEB: break; 
+        case PARADO_WEB: 
+            // Nenhuma variável local inicializada aqui que cause problema
+            break; 
+
         case INICIANDO_EXPLORACAO_WEB:
+            // Nenhuma variável local inicializada aqui que cause problema
             broadcastSerialLn("WEB: Iniciando Exploração -> Seguindo Linha");
             estadoRoboAtual = SEGUINDO_LINHA_WEB;
-            precisaConfirmarNo = false; // Reseta flag de confirmação
+            lateralEsquerdaEncontradaBusca = false;
+            lateralDireitaEncontradaBusca = false;
             break;
 
         case SEGUINDO_LINHA_WEB:
-            if (precisaConfirmarNo) { // Se estava confirmando e voltou para seguir linha (decisão foi NAO_E_NO)
-                precisaConfirmarNo = false;
-            }
-            pid_controlado_web(); // Esta função agora vai detectar e pode mudar o estado
+            // Nenhuma variável local inicializada aqui que cause problema
+            pid_controlado_web(); 
             break;
 
-        case CONFIRMANDO_NO_AVANCA: // Novo estado
-            // Verifica se o tempo de avanço já passou
-            if (millis() - inicioMovimentoConfirmacao >= DURACAO_MOV_CONFIRMACAO_MS) {
+       
+
+          case PREPARANDO_ANALISE_NO:
+            pararMotoresWebService(); // Garante que parou completamente
+            achouEsquerdaNoPonto1 = false; // Reseta flags
+            achouDireitaNoPonto1 = false;
+            achouFrenteNoPonto2 = false;
+            
+            broadcastSerialLn("[AnalisaNó] Fase 1: Iniciando avanço curto para posicionamento...");
+            inicioAvanco = millis();
+            motor('a', 'f', VELOCIDADE_POSICIONAMENTO); // Começa a avançar
+            estadoRoboAtual = AVANCO_POSICIONAMENTO_NO;
+            break;
+
+        case AVANCO_POSICIONAMENTO_NO:
+            if (millis() - inicioAvanco >= TEMPO_POSICIONAMENTO_NO_MS) {
                 pararMotoresWebService();
-                broadcastSerialLn("[ConfirmNode] Avanço concluído. Reavaliando...");
-                estadoRoboAtual = REAVALIANDO_NO_POS_AVANCO;
+                broadcastSerialLn("[AnalisaNó] Avanço de posicionamento concluído. Lendo laterais...");
+                delay(TEMPO_LEITURA_ESTAVEL_MS); // Espera um pouco para sensores estabilizarem
+                lerSens(); // Atualiza sensorValues
+
+                // Checa saídas laterais (sensores extremos 0 e 6)
+                if (sensorVePreto(S_ESQUERDO_EXTREMO)) {
+                    achouEsquerdaNoPonto1 = true;
+                }
+                if (sensorVePreto(S_DIREITO_EXTREMO)) {
+                    achouDireitaNoPonto1 = true;
+                }
+                broadcastSerialLn("[AnalisaNó] Ponto 1 - Esquerda: " + String(achouEsquerdaNoPonto1) + " | Direita: " + String(achouDireitaNoPonto1));
+
+                // Prepara para o próximo avanço (checar frente)
+                broadcastSerialLn("[AnalisaNó] Fase 2: Iniciando avanço para checar frente...");
+                inicioAvanco = millis();
+                motor('a', 'f', VELOCIDADE_CHECA_FRENTE);
+                estadoRoboAtual = AVANCO_CHECA_FRENTE_NO;
             } else {
-                // Continua avançando devagar (já iniciado em pid_controlado_web)
-                // motor('a', 'f', VELOCIDADE_CONFIRMACAO); // Certifique-se que o motor está andando
+                 motor('a', 'f', VELOCIDADE_POSICIONAMENTO); // Continua avançando se o tempo não acabou
             }
             break;
 
-        case REAVALIANDO_NO_POS_AVANCO: // Novo estado
-            lerSens(); // Lê os sensores após o pequeno avanço
-            classificarNoAposAvanco(padraoInicialDetectado); // Nova função para tomar a decisão final
-                                                             // Esta função definirá ultimoNoClassificado e mudará estado para EM_NO_WEB
-            precisaConfirmarNo = false;
+        case AVANCO_CHECA_FRENTE_NO:
+            if (millis() - inicioAvanco >= TEMPO_CHECA_FRENTE_NO_MS) {
+                pararMotoresWebService();
+                broadcastSerialLn("[AnalisaNó] Avanço para checar frente concluído. Lendo frente...");
+                delay(TEMPO_LEITURA_ESTAVEL_MS);
+                lerSens();
+
+                // Checa caminho à frente (sensores centrais do PID: 2, 3, 4)
+                // Uma condição mais robusta: pelo menos o central E um dos vizinhos, ou todos os 3
+                if (sensorVePreto(S_CENTRAL_MEIO) || 
+                    (sensorVePreto(S_CENTRAL_ESQUERDO) || sensorVePreto(S_CENTRAL_DIREITO)) ) {
+                    achouFrenteNoPonto2 = true;
+                }
+                // Ou, se os 3 estiverem pretos:
+                // if (sensorVePreto(S_CENTRAL_ESQUERDO) && sensorVePreto(S_CENTRAL_MEIO) && sensorVePreto(S_CENTRAL_DIREITO)) {
+                //    achouFrenteNoPonto2 = true;
+                // }
+                broadcastSerialLn("[AnalisaNó] Ponto 2 - Frente: " + String(achouFrenteNoPonto2));
+                
+                estadoRoboAtual = CLASSIFICACAO_DETALHADA_NO;
+            } else {
+                motor('a', 'f', VELOCIDADE_CHECA_FRENTE); // Continua avançando
+            }
             break;
 
-        case PAUSADO_WEB: break;
+        case CLASSIFICACAO_DETALHADA_NO:
+            broadcastSerialLn("[Classifica] Dados para classificar: EsqP1=" + String(achouEsquerdaNoPonto1) + 
+                                                                " | DirP1=" + String(achouDireitaNoPonto1) + 
+                                                                " | FreP2=" + String(achouFrenteNoPonto2) );
+
+
+            if (achouFrenteNoPonto2) {
+                if (achouEsquerdaNoPonto1 && achouDireitaNoPonto1) ultimoNoClassificado = NO_FINAL_CRUZAMENTO;
+                else if (achouEsquerdaNoPonto1) ultimoNoClassificado = NO_FINAL_T_COM_FRENTE_ESQ;
+                else if (achouDireitaNoPonto1) ultimoNoClassificado = NO_FINAL_T_COM_FRENTE_DIR;
+                else ultimoNoClassificado = NO_FINAL_RETA_SIMPLES; // Linha reta (inesperado aqui, mas é uma saída)
+            } else { // Sem caminho em frente claro após o segundo avanço
+                if (achouEsquerdaNoPonto1 && achouDireitaNoPonto1) ultimoNoClassificado = NO_FINAL_T_SEM_FRENTE; // "Pé" do T
+                else if (achouEsquerdaNoPonto1) ultimoNoClassificado = NO_FINAL_CURVA_90_ESQ;
+                else if (achouDireitaNoPonto1) ultimoNoClassificado = NO_FINAL_CURVA_90_DIR;
+                else ultimoNoClassificado = NO_FINAL_BECO_SEM_SAIDA; 
+            }
+            broadcastSerialLn("LeituraSensores: \n s3: " + String(sensorValues[2]) + " s4: " + sensorValues[3] + " s5: " + sensorValues[4]);
+            broadcastSerialLn("Decisão Final do Nó: " + nomeDoNo(ultimoNoClassificado));
+            estadoRoboAtual = EM_NO_WEB;
+            break;
+
+        case PAUSADO_WEB: 
+            // Nenhuma variável local inicializada aqui que cause problema
+            break;
         case EM_NO_WEB:
-            //broadcastSerialLn("WEB: Robô em Nó (" + nomeDoNo(ultimoNoClassificado) + "). Aguardando...");
-            // Aqui você precisaria de uma lógica para o robô decidir o que fazer
-            // com base no 'ultimoNoClassificado' e no seu algoritmo de grafo.
-            // Por enquanto, ele para. Para reiniciar a exploração, o usuário clica em "Iniciar".
+            // A mensagem já foi impressa na transição para este estado
             break;
-        case CALIBRANDO_LINHA_WEB:
-            // Como a calibração é bloqueante e chamada pelo handler, este case pode não ser muito usado no loop
-            break;
+        case CALIBRANDO_LINHA_WEB: 
+            // Nenhuma variável local inicializada aqui que cause problema
+            break; 
         default:
+            // Nenhuma variável local inicializada aqui que cause problema
             pararMotoresWebService(); estadoRoboAtual = PARADO_WEB;
             broadcastSerialLn("[AVISO] Estado desconhecido, robô parado.");
             break;
     }
-    delay(10); 
+    delay(20); 
 }
 
 
@@ -989,175 +1035,4 @@ void lerSens() {
                                                // similar a calcularPosicaoPID_3Sensores mas para 7 sensores.
                                                // Por agora, vamos focar no PID com 3 sensores.
                                                // 'detectarTipoDeNo' usará o array 'sensorValues' diretamente.
-}
-
-// Sua função PID original, caso queira usá-la por outros meios (não chamada pela web diretamente)
-void pid_seguelinha_original() {
-    lerSens();
-    int m1Speed;
-    int m2Speed;
-    
-    second_lastError = lastError;
-    lastError=error;
-    error = posicao - setPoint;
-    
-
-    // Serial.println("Setpoint: " + String(setPoint) + " Erro: " + String(error) + " m1Speed: " + String(m1Speed) + " m2Speed: " + String(m2mSpeed) );
-    
-    if(abs(error) == 3000)
-    {
-        
-        if(abs(lastError) < 1100 && abs(second_lastError) < 1100)
-        {
-            error = 0;  
-            Serial.println("REEEEEEEEE");
-        }  
-        else Serial.println("talvez");
-    } 
-
-    I_pid = I_pid + error;
-    
-    int motorSpeed = current_KP * error + current_KD * (error - lastError) + current_KI*I_pid;
-    
-    
-
-
-    if(abs(error) == 3000)
-    {
-        Serial.print("  talvez Le: "+ String(abs(lastError)) + " LLE: "+String(abs(second_lastError)) + "   ");
-        //delay(1300);
-        if(abs(lastError) < 1000 && abs(second_lastError) < 1000)
-        {
-            error = 0;   
-            Serial.println("REEEEEEEEE");
-            for(int i = 0; i < 50; i ++)
-            {
-              Serial.println("REEEEEEEEE");
-              motor('e','f',200);
-              motor('d','f',200);
-            }
-            
-            // delay(500);
-            // motor('a','f',0);
-        }  
-    }  
- 
-    if(abs(error) <= 200)
-    {
-         m1Speed = current_Mm1_reta - motorSpeed;
-    
-         m2Speed = current_Mm2_reta + motorSpeed;  
-    }
-    else
-    {
-         m1Speed = current_M1_base - motorSpeed;
-    
-         m2Speed = current_M2_base + motorSpeed;  
-    }
-    if (m1Speed < current_MMAX2_reverso) m1Speed =  current_MMAX2_reverso;           // Determina o limite inferior
-
-    //Serial.println("Setpoint: " + String(setPoint) + " Erro: " + String(error) + " m1Speed: " + String(m1Speed) + " m2Speed: " + String(m2Speed)  + " motorSpeed: " + String(motorSpeed));
-
-    if (m2Speed < current_MMAX2_reverso) m2Speed = current_MMAX2_reverso;           // Determina o limite inferior
-    
-    
-    if (m1Speed > current_MMAX_curva) m1Speed = current_MMAX_curva;     // Determina o limite superior
-    
-    if (m2Speed > current_MMAX_curva)  m2Speed = current_MMAX_curva;     // Determina o limite superior
-    
-    if(m1Speed < 0)  motor('d', 't', abs(m1Speed)); 
-    else motor('d', 'f', abs(m1Speed));
-    
-   
-    if(m2Speed < 0)
-    {
-        motor('e', 't', abs(m2Speed)); 
-    }
-    else
-    {
-        motor('e', 'f', abs(m2Speed));
-    }
-}
-
-
-// --- Funções MPU6050 ---
-void configurarEscalaGiroscopio() {
-  Wire.beginTransmission(MPU_ADDR); Wire.write(0x1B); Wire.write(0x00); Wire.endTransmission(true);
-  Wire.beginTransmission(MPU_ADDR); Wire.write(0x1B); Wire.endTransmission(false);
-  Wire.requestFrom(MPU_ADDR, 1, true); uint8_t gyroConfig = Wire.read();
-  uint8_t fs_sel = (gyroConfig >> 3) & 0x03;
-  if (fs_sel < 4) gyroScaleFactor = gyroScaleFactors[fs_sel]; else gyroScaleFactor = 131.0;
-  Serial.print("Giroscopio configurado com escala: +/-");
-  if (fs_sel == 0) Serial.println("250 deg/s"); else if (fs_sel == 1) Serial.println("500 deg/s");
-  else if (fs_sel == 2) Serial.println("1000 deg/s"); else if (fs_sel == 3) Serial.println("2000 deg/s");
-  else Serial.println("Desconhecido");
-}
-
-void calibrarGiroscopio() {
-  long gxT=0, gyT=0, gzT=0; Serial.println("Calibrando giroscopio MPU...");
-  for (int i=0; i < calibracoes_mpu; i++) {
-    Wire.beginTransmission(MPU_ADDR); Wire.write(0x43); Wire.endTransmission(false);
-    Wire.requestFrom(MPU_ADDR, 6, true);
-    gyroX_raw = Wire.read()<<8|Wire.read(); gyroY_raw = Wire.read()<<8|Wire.read(); gyroZ_raw = Wire.read()<<8|Wire.read();
-    gxT+=gyroX_raw; gyT+=gyroY_raw; gzT+=gyroZ_raw;
-    if(i%(calibracoes_mpu/10)==0) Serial.print("."); delay(3);
-  }
-  Serial.println();
-  gyroXOffset=(float)gxT/calibracoes_mpu; gyroYOffset=(float)gyT/calibracoes_mpu; gyroZOffset=(float)gzT/calibracoes_mpu;
-  Serial.print("Offsets Gyro: X="); Serial.print(gyroXOffset); Serial.print(", Y="); Serial.print(gyroYOffset); Serial.print(", Z="); Serial.println(gyroZOffset);
-  Serial.println("Cal. giroscopio MPU concluida.");
-}
-
-void salvarCalibracaoEEPROM() {
-  EEPROM.begin(512);
-  EEPROM.put(EEPROM_OFFSET_ADDR, gyroXOffset);
-  EEPROM.put(EEPROM_OFFSET_ADDR + sizeof(gyroXOffset), gyroYOffset);
-  EEPROM.put(EEPROM_OFFSET_ADDR + 2*sizeof(gyroXOffset), gyroZOffset);
-  if(EEPROM.commit()) Serial.println("Calibracao MPU salva na EEPROM."); else Serial.println("Erro ao salvar cal. MPU na EEPROM.");
-  EEPROM.end();
-}
-
-bool carregarCalibracaoEEPROM() {
-  EEPROM.begin(512);
-  EEPROM.get(EEPROM_OFFSET_ADDR, gyroXOffset);
-  EEPROM.get(EEPROM_OFFSET_ADDR + sizeof(gyroXOffset), gyroYOffset);
-  EEPROM.get(EEPROM_OFFSET_ADDR + 2*sizeof(gyroXOffset), gyroZOffset);
-  EEPROM.end();
-  if (isnan(gyroXOffset) || isnan(gyroYOffset) || isnan(gyroZOffset) || (abs(gyroXOffset) < 0.01 && abs(gyroYOffset) < 0.01 && abs(gyroZOffset) < 0.01 && gyroXOffset !=0 )) { // Adicionada checagem para valores muito próximos de zero mas não zero, o que pode indicar uma calibração não salva ou zerada
-    Serial.println("Calibracao MPU nao encontrada ou invalida na EEPROM. Realizar nova calibracao."); return false;
-  }
-  Serial.println("Calibracao MPU carregada da EEPROM."); return true;
-}
-
-float getAngleMPU(char eixo) {
-  currentTime_mpu = micros();
-  elapsedTime_mpu = (currentTime_mpu - previousTime_mpu) / 1000000.0; 
-  previousTime_mpu = currentTime_mpu;
-
-  Wire.beginTransmission(MPU_ADDR); Wire.write(0x3B); Wire.endTransmission(false);
-  Wire.requestFrom(MPU_ADDR, 6, true);
-  accX_raw = Wire.read()<<8|Wire.read(); accY_raw = Wire.read()<<8|Wire.read(); accZ_raw = Wire.read()<<8|Wire.read();
-
-  accAngleX = atan2(accY_raw, accZ_raw) * 180 / PI;
-  accAngleY = atan2(-accX_raw, sqrt(accY_raw * accY_raw + accZ_raw * accZ_raw)) * 180 / PI;
-
-  Wire.beginTransmission(MPU_ADDR); Wire.write(0x43); Wire.endTransmission(false);
-  Wire.requestFrom(MPU_ADDR, 6, true);
-  gyroX_raw = Wire.read()<<8|Wire.read(); gyroY_raw = Wire.read()<<8|Wire.read(); gyroZ_raw = Wire.read()<<8|Wire.read();
-
-  gyroRateX = (gyroX_raw - gyroXOffset) / gyroScaleFactor;
-  gyroRateY = (gyroY_raw - gyroYOffset) / gyroScaleFactor;
-  gyroRateZ = (gyroZ_raw - gyroZOffset) / gyroScaleFactor;
-
-  angleX += gyroRateX * elapsedTime_mpu;
-  angleY += gyroRateY * elapsedTime_mpu;
-  angleZ += gyroRateZ * elapsedTime_mpu;
-
-  angleX = accAngleCorrectionFactor * angleX + (1.0 - accAngleCorrectionFactor) * accAngleX;
-  angleY = accAngleCorrectionFactor * angleY + (1.0 - accAngleCorrectionFactor) * accAngleY;
-
-  if (eixo == 'X') return angleX;
-  else if (eixo == 'Y') return angleY;
-  else if (eixo == 'Z') return angleZ;
-  return 0;
 }
