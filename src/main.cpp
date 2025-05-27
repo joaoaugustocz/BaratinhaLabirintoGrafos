@@ -1,4 +1,6 @@
 #include <Arduino.h>
+#include "Baratinha.h" // Incluindo a classe Baratinha
+#include "DFSManager.h" // Incluindo o gerenciador de DFS
 #include <FastLED.h>
 #include <QTRSensors.h>
 #include <WiFi.h>
@@ -6,8 +8,10 @@
 #include <WebSocketsServer.h> // Para WebSockets
 #include <FS.h>               // Necessário para o sistema de arquivos
 #include <LittleFS.h>         // Usando LittleFS
-#include <tipos.h>
-#include <DFSManager.h> // Incluindo o gerenciador de DFS
+#include "tipos.h"
+
+
+Baratinha bra;
 
 //------ GRAFOS ------------//
 
@@ -29,8 +33,8 @@ DFSManager dfsManager;
 // --- Configurações de Wi-Fi ---
 const char* ssid = "Joao_2G";
 const char* password = "Naotemsenha";
-// const char* ssid = "DevTecnico";
-// const char* password = "EquipeHard#";
+// const char* ssid = "CriarCe Coordenacao";
+// const char* password = "inovareempreender";
 
 // --- Servidor Web HTTP ---
 WebServer httpServer(80);
@@ -76,7 +80,7 @@ const int DURACAO_BUSCA_LATERAL_MS = 600;     // Max tempo para achar uma latera
 const int DURACAO_AVANCO_FRENTE_MS = 200;     // Tempo para avançar e checar a frente
 const int VELOCIDADE_AVANCO_CONFIRM = 40;   // Velocidade para os avanços
 
-const int TEMPO_AVANCO_CONFIRMA_FIM_MS = 300; // Tempo para avançar e confirmar área toda preta (ajuste!)
+const int TEMPO_AVANCO_CONFIRMA_FIM_MS = 100; // Tempo para avançar e confirmar área toda preta (ajuste!)
 // A VELOCIDADE_AVANCO_CONFIRM (40) pode ser usada aqui também, ou uma específica.
 
 TipoDeNoFinal classificacaoPreliminarDoNo = NO_FINAL_NAO_E; 
@@ -101,8 +105,8 @@ TipoDeNoFinal classificacaoPreliminarDoNo = NO_FINAL_NAO_E;
 int posicao = 0; 
 
 #define KP_3 0.1
-#define KI_3 0//0.0003
-#define KD_3 0//1.75
+#define KI_3 0.001//0.0003
+#define KD_3 0.1//1.75
 #define M1_BASE_3 30 
 #define M2_BASE_3 30  
 #define Mm1_RETA_3 30 
@@ -230,8 +234,6 @@ void pararMotoresWebService() {
     Serial.println("Motores Parados (Controle Web)");
 }
 
-
-
 // Esta função assume que sensorValues[] já foi populado por qtr.readCalibrated()
 // e que os valores estão na faixa 0-1000 (onde ~1000 = linha preta para readLineBlack)
 uint16_t calcularPosicaoPID_3Sensores(uint16_t* qtr_sensorValues) {
@@ -274,7 +276,6 @@ uint16_t calcularPosicaoPID_3Sensores(uint16_t* qtr_sensorValues) {
 
     return avg / sum;
 }
-
 
 // --- Funções Auxiliares para Detecção de Nós (ATUALIZADAS) ---
 
@@ -863,6 +864,20 @@ bool virar_180_preciso() {
     }
 }
 
+
+void callbackParaCriarNoWeb(int id, TipoDeNoFinal tipo, int idPai) {
+    String label = nomeDoNo(tipo) + "_ID" + String(id); // Usa sua função nomeDoNo
+    String msgNode = "newNode:" + String(id) + ":" + label;
+    webSocketServer.broadcastTXT(msgNode);
+    broadcastSerialLn("[Grafo Web] Nó Criado: ID=" + String(id) + " Label=" + label + " Pai=" + String(idPai));
+}
+
+void callbackParaCriarArestaWeb(int idOrigem, int idDestino, const char* edgeLabel) {
+    String msgEdge = "newEdge:" + String(idOrigem) + ":" + String(idDestino) + ":" + String(edgeLabel);
+    webSocketServer.broadcastTXT(msgEdge);
+    broadcastSerialLn("[Grafo Web] Aresta Criada: De=" + String(idOrigem) + " Para=" + String(idDestino) + " Label=" + String(edgeLabel));
+}
+
 // --- SETUP ---
 void setup() {
     Serial.begin(115200);
@@ -947,25 +962,13 @@ void setup() {
     webSocketServer.onEvent(webSocketEvent);
     Serial.println("Servidor WebSocket iniciado na porta 81!");
 
-    ledcSetup(LEDC_CANAL_MOTOR_ESQUERDO, LEDC_FREQ, LEDC_RESOLUTION);
-    ledcAttachPin(pwmM1, LEDC_CANAL_MOTOR_ESQUERDO); 
-    ledcSetup(LEDC_CANAL_MOTOR_DIREITO, LEDC_FREQ, LEDC_RESOLUTION);
-    ledcAttachPin(pwmM2, LEDC_CANAL_MOTOR_DIREITO);  
+    bra.setupLEDs();
+    bra.setupMotores();
+    bra.setupSensoresLinha();
 
-    gpio_set_direction(in1, GPIO_MODE_INPUT_OUTPUT);
-    gpio_set_direction(in2, GPIO_MODE_INPUT_OUTPUT);
-    gpio_set_direction(in3, GPIO_MODE_INPUT_OUTPUT);
-    gpio_set_direction(in4, GPIO_MODE_INPUT_OUTPUT); 
-
-    pararMotoresWebService();
-
-    uint8_t pins_qtr_config[] = {s1, s2, s3, s4, s5, s6, s7}; // Array para QTR
-    qtr.setTypeAnalog();
-    qtr.setSensorPins(pins_qtr_config, SensorCount);
-
-    //Serial.println("Calibração inicial dos sensores de linha no setup...");
-    //broadcastSerialLn("Calibração inicial dos sensores de linha no setup...");
-    //executarCalibracaoLinhaWebService(); 
+   
+    dfsManager.resetarDFS(); // Importante para limpar o estado do DFS
+    broadcastSerialLn("DFS Manager resetado no setup.");
 
     Serial.println("Fim setup. Robô pronto em estado PARADO_WEB.");
     broadcastSerialLn("Fim setup. Robô pronto em estado PARADO_WEB.");
@@ -989,23 +992,27 @@ void loop()
             break; 
 
         case INICIANDO_EXPLORACAO_WEB:
+            if (primeiroNo) 
+            { // 'primeiroNo' é a sua flag global
+                idNoAnterior = -1;       // Correto para o nó INICIO (não tem pai na lógica do main)
+                idNoAtual = idProximoNo++; // idNoAtual recebe o ID do INICIO (ex: 0), idProximoNo avança (ex: para 1)
 
-            if (primeiroNo) { // Só executa na primeira vez que a exploração é iniciada
-                idNoAnterior = -1; // O nó "Inicio" não tem um anterior
-                idNoAtual = idProximoNo++; // Define o ID para o nó "Inicio"
-
-                String nomeNoInicio = "INICIO_ID" + String(idNoAtual); // Cria um label único
+                String nomeNoInicio = "INICIO_ID" + String(idNoAtual);
                 broadcastSerialLn("[Grafo] Criando Nó Inicial! ID: " + String(idNoAtual) + ", Label: " + nomeNoInicio);
-
-                // Envia a mensagem para a interface web criar o nó visualmente
                 String msgNode = "newNode:" + String(idNoAtual) + ":" + nomeNoInicio;
                 webSocketServer.broadcastTXT(msgNode);
 
-                primeiroNo = false; // Garante que o nó "Inicio" não seja criado novamente
+                // Informa o DFSManager. NO_FINAL_RETA_SIMPLES é um tipo placeholder para o INICIO.
+                // 'true' para temFrenteInicial indica que a partir do INICIO, o robô vai "em frente".
+                dfsManager.iniciarNovaExploracao(idNoAtual, NO_FINAL_RETA_SIMPLES, true);
+                
+                primeiroNo = false;
             }
+
 
             // Nenhuma variável local inicializada aqui que cause problema
             broadcastSerialLn("WEB: Iniciando Exploração -> Seguindo Linha");
+            idNoAnterior = idNoAtual; 
             estadoRoboAtual = SEGUINDO_LINHA_WEB;
             lateralEsquerdaEncontradaBusca = false;
             lateralDireitaEncontradaBusca = false;
@@ -1201,125 +1208,116 @@ void loop()
         case PAUSADO_WEB: 
             // Nenhuma variável local inicializada aqui que cause problema
             break;
-         case EM_NO_WEB:
-            {
-            broadcastSerialLn("Decisão Final do Nó: " + nomeDoNo(ultimoNoClassificado));
-            // A mensagem "Decisão Final do Nó: ..." já foi impressa.
-            // Este é o ponto onde o robô PAROU e CLASSIFICOU um nó.
+        case EM_NO_WEB:
+        {
+            // idNoAnterior (global) é o ID do nó de onde viemos (ex: 0 para o INICIO).
+            // ultimoNoClassificado é o tipo do local físico ATUAL.
+            // achouEsquerdaNoPonto1, etc., são as saídas do local físico ATUAL.
 
-            // 1. ATUALIZAR INFORMAÇÕES DO NÓ ATUAL E ANTERIOR
-            // Só registra se o nó for "real" e não um erro ou simples reta que não deveria ter parado aqui.
-            // E também não registra se for o FIM, pois a exploração para.
-            if (ultimoNoClassificado != NO_FINAL_NAO_E && 
-                ultimoNoClassificado != NO_FINAL_RETA_SIMPLES &&
-                ultimoNoClassificado != NO_FINAL_FIM_DO_LABIRINTO) { // Não registra o "FIM" como um nó do qual se parte
-                
-                idNoAnterior = idNoAtual; 
-                idNoAtual = idProximoNo++;  
+            // Para um novo local físico, usamos o próximo ID da interface como candidato.
+            // Se estivermos voltando para um nó conhecido (após backtrack), idNoAtual já
+            // terá sido ajustado pelo DFSManager na chamada anterior para refletir o nó pai.
+            // A primeira vez que chegamos aqui após INICIO, idNoAtual ainda é o ID do INICIO (ex:0).
+            // Isso precisa ser tratado: se não estamos explicitamente voltando (backtracking),
+            // a parada atual é um *novo local potencial*.
 
-                broadcastSerialLn("[Grafo] Nó Descoberto! ID Atual: " + String(idNoAtual) + 
-                                  ", Tipo: " + nomeDoNo(ultimoNoClassificado) + 
-                                  ". Veio do Nó ID: " + String(idNoAnterior));
+            int idParaProcessarNoDFS;
+            int idPaiParaDFS = idNoAnterior; // De onde viemos é o pai do nó atual, se for novo
 
-                String msgNode = "newNode:" + String(idNoAtual) + ":" + nomeDoNo(ultimoNoClassificado) + "_ID" + String(idNoAtual);
-                webSocketServer.broadcastTXT(msgNode);
+            // Lógica para determinar se estamos descobrindo um novo nó ou revisitando um nó via backtrack:
+            // Por agora, vamos assumir que, a menos que uma ação de backtrack tenha explicitamente
+            // definido idNoAtual para um nó pai, qualquer parada em EM_NO_WEB após SEGUINDO_LINHA_WEB
+            // é uma potencial nova descoberta.
+            // Se idNoAtual ainda é o mesmo que idNoAnterior, é porque o DFS está re-processando o mesmo nó
+            // (como no seu log), ou é a primeira parada após o INICIO onde idNoAtual era o INICIO e idNoAnterior também se tornou INICIO.
 
-                if (!primeiroNo && idNoAnterior != -1) { 
-                    String msgEdge = "newEdge:" + String(idNoAnterior) + ":" + String(idNoAtual) + ":Segue";
-                    webSocketServer.broadcastTXT(msgEdge);
-                }
-                primeiroNo = false; 
-            } else if (ultimoNoClassificado == NO_FINAL_FIM_DO_LABIRINTO && primeiroNo) {
-                // Caso especial: Se o PRIMEIRO nó encontrado já é o fim.
-                idNoAnterior = -1; // Não há nó anterior válido para a aresta inicial
-                idNoAtual = idProximoNo++;
-                broadcastSerialLn("[Grafo] Nó Descoberto! ID Atual: " + String(idNoAtual) + 
-                                  ", Tipo: " + nomeDoNo(ultimoNoClassificado) + 
-                                  ". (É o FIM e o primeiro nó)");
-                String msgNode = "newNode:" + String(idNoAtual) + ":" + nomeDoNo(ultimoNoClassificado) + "_ID" + String(idNoAtual);
-                webSocketServer.broadcastTXT(msgNode);
-                primeiroNo = false; 
-            } else if (ultimoNoClassificado == NO_FINAL_FIM_DO_LABIRINTO && idNoAnterior != -1) {
-                 // Se o FIM é encontrado e não é o primeiro nó (ou seja, veio de algum lugar)
-                 // Registra o nó do FIM e a aresta até ele.
-                idNoAnterior = idNoAtual; // O nó que ele estava antes de chegar ao FIM
-                idNoAtual = idProximoNo++;  // ID para o nó FIM
-                broadcastSerialLn("[Grafo] Nó Descoberto! ID Atual: " + String(idNoAtual) + 
-                                  ", Tipo: " + nomeDoNo(ultimoNoClassificado) + 
-                                  ". Veio do Nó ID: " + String(idNoAnterior));
-                String msgNode = "newNode:" + String(idNoAtual) + ":" + nomeDoNo(ultimoNoClassificado) + "_ID" + String(idNoAtual);
-                webSocketServer.broadcastTXT(msgNode);
-                String msgEdge = "newEdge:" + String(idNoAnterior) + ":" + String(idNoAtual) + ":ChegouAoFim";
-                webSocketServer.broadcastTXT(msgEdge);
-                primeiroNo = false;
-            }
-
-            // 3. LÓGICA DE DECISÃO DE EXPLORAÇÃO (DFS MUITO SIMPLES - REGRA DA MÃO ESQUERDA)
-            // Prioridade: Esquerda, Frente, Direita, Ré.
-            // Isso é uma simplificação. Um DFS real precisaria marcar caminhos já explorados A PARTIR deste nó.
-            bool manobraExecutada = false;
-            
-             // --- ADICIONAR CHECAGEM PRIORITÁRIA PARA FIM_DO_LABIRINTO ---
-            if (ultimoNoClassificado == NO_FINAL_FIM_DO_LABIRINTO) {
-                broadcastSerialLn("[AcaoNo] FIM DO LABIRINTO ALCANÇADO! Exploração interrompida.");
-                pararMotoresWebService(); 
-                // Não executa manobra de virada, não volta a seguir linha.
-                // O robô pode mudar para PARADO_WEB ou um estado específico de "FIM_ENCONTRADO".
-                // Para o Dijkstra depois, este 'idNoAtual' será o nó de destino.
-                estadoRoboAtual = PARADO_WEB; // Para a exploração.
-                manobraExecutada = true; // Consideramos que a "ação" (parar) foi concluída.
-            }
-            // --- FIM DA CHECAGEM DE FIM_DO_LABIRINTO ---
-            else if (ultimoNoClassificado == NO_FINAL_BECO_SEM_SAIDA) {
-                broadcastSerialLn("[DFS] Beco sem saída. Dando meia volta...");
-                manobraExecutada = virar_180_preciso();
-            } 
-            else if (ultimoNoClassificado == NO_FINAL_CURVA_90_ESQ ||
-                       ultimoNoClassificado == NO_FINAL_T_COM_FRENTE_ESQ ||
-                       ultimoNoClassificado == NO_FINAL_T_SEM_FRENTE || 
-                       ultimoNoClassificado == NO_FINAL_CRUZAMENTO) {
-                // Lógica de priorizar esquerda para DFS simplificado
-                broadcastSerialLn("[DFS] Opção à Esquerda disponível/priorizada. Virando à ESQUERDA.");
-                manobraExecutada = virar_esquerda_90_preciso();
-            } 
-            else if (ultimoNoClassificado == NO_FINAL_T_COM_FRENTE_DIR) { 
-                // Se não caiu na prioridade da esquerda, e é um T com frente e direita, testa direita
-                broadcastSerialLn("[DFS] Opção Frente e Direita. TESTE: Virando à DIREITA.");
-                manobraExecutada = virar_direita_90_preciso();
-            } 
-            else if (ultimoNoClassificado == NO_FINAL_RETA_SIMPLES) {  
-                broadcastSerialLn("[DFS] Reta simples detectada pós-confirmação. Seguindo em FRENTE.");
-                motor('a', 'f', VELOCIDADE_AJUSTE_FINAL); //delay(TEMPO_AJUSTE_FINAL_MS); pararMotoresWebService();
-                manobraExecutada = true; 
-            } 
-            else if (ultimoNoClassificado == NO_FINAL_CURVA_90_DIR) {
-                broadcastSerialLn("[DFS] Curva de 90 Direita. Virando à DIREITA.");
-                manobraExecutada = virar_direita_90_preciso();
-            }
-            else { // NO_FINAL_NAO_E ou default não tratado explicitamente acima
-                broadcastSerialLn("[DFS] Nenhuma regra de exploração clara para " + nomeDoNo(ultimoNoClassificado) + ". Parando ou voltando.");
-                // Poderia ser uma meia volta como fallback se for um tipo de nó inesperado
-                // ou se for NO_FINAL_NAO_E (que não deveria acontecer se classificarNoAposAvanco for robusto)
-                if (ultimoNoClassificado == NO_FINAL_NAO_E) {
-                    manobraExecutada = false; // Indica falha em classificar, leva à parada
-                } else {
-                    manobraExecutada = virar_180_preciso(); // Fallback para outros tipos de nós não listados
-                }
-            }
-
-            // 4. DECIDIR PRÓXIMO ESTADO GERAL
-            if (manobraExecutada) {
-                // Se o estado já foi definido para PARADO_WEB (como no caso do FIM_DO_LABIRINTO), não muda.
-                if (estadoRoboAtual != PARADO_WEB) { 
-                    broadcastSerialLn("[DFS] Manobra de exploração ("+ nomeDoNo(ultimoNoClassificado) +") bem-sucedida. Retomando seguimento de linha...");
-                    estadoRoboAtual = INICIANDO_EXPLORACAO_WEB; 
-                }
+            // Se idNoAtual ainda é o ID do nó de ONDE SAÍMOS (idNoAnterior),
+            // então este local atual é um NOVO local físico e precisa de um novo ID candidato.
+            if (idNoAtual == idNoAnterior && idNoAnterior != -1) { // Checagem para o caso de primeira parada após um nó
+                idParaProcessarNoDFS = idProximoNo; // Usa o próximo ID disponível da interface
             } else {
-                broadcastSerialLn("[DFS] ERRO na manobra ("+ nomeDoNo(ultimoNoClassificado) +") ou manobra não definida. Robô PARADO.");
-                estadoRoboAtual = PARADO_WEB; 
+                // Se idNoAtual foi modificado por um backtrack para ser o ID do pai, ou é o INICIO pela primeira vez.
+                idParaProcessarNoDFS = idNoAtual;
             }
-        } // Fim do escopo do case EM_NO_WEB
-            break; 
+
+
+            broadcastSerialLn("EM_NO_WEB - Candidato ID p/ DFS: " + String(idParaProcessarNoDFS) +
+                            ", Pai Potencial (Vindo de): " + String(idPaiParaDFS) +
+                            ", Tipo Detectado: " + nomeDoNo(ultimoNoClassificado));
+
+            AcaoDFS acaoDecidida = dfsManager.processarNoAtual(
+                idParaProcessarNoDFS,  // Passado por referência. Será atualizado pelo DFSManager com o ID real do nó processado.
+                idPaiParaDFS,          // Passado por referência. Será atualizado pelo DFSManager se for uma ação de avanço.
+                ultimoNoClassificado,
+                achouEsquerdaNoPonto1,
+                achouFrenteNoPonto2,
+                achouDireitaNoPonto1,
+                callbackParaCriarNoWeb,
+                callbackParaCriarArestaWeb
+            );
+
+            // Após a chamada, idParaProcessarNoDFS contém o ID DFS real do nó que acabamos de analisar/registrar.
+            idNoAtual = idParaProcessarNoDFS; // Atualiza o idNoAtual global do main.cpp
+
+            // Se um novo nó foi de fato criado e utilizou o idProximoNo da interface, avançamos o contador.
+            // O DFSManager agora gerencia seus próprios IDs com idProximoNoUnico e os retorna.
+            // Se o idNoAtual (que foi atualizado pelo DFSManager) for >= ao idProximoNo do main,
+            // significa que o DFSManager usou ou atribuiu um ID que o main ainda não usou para a interface.
+            if (idNoAtual >= idProximoNo) {
+                idProximoNo = idNoAtual + 1; // Garante que o próximo ID da interface seja novo
+            }
+
+            int idParaSerOAnteriorNoProximoPasso = idNoAtual;
+
+            bool manobraFisicaOK = false;
+            switch (acaoDecidida) {
+                case ACAO_DFS_VIRAR_ESQUERDA:
+                case ACAO_DFS_SEGUIR_FRENTE:
+                case ACAO_DFS_VIRAR_DIREITA:
+                    broadcastSerialLn("[EM_NO_WEB] DFS decidiu: AVANÇAR/VIRAR");
+                    if (acaoDecidida == ACAO_DFS_VIRAR_ESQUERDA) manobraFisicaOK = virar_esquerda_90_preciso();
+                    else if (acaoDecidida == ACAO_DFS_SEGUIR_FRENTE) manobraFisicaOK = true; // Assume que seguir em frente é só continuar
+                    else if (acaoDecidida == ACAO_DFS_VIRAR_DIREITA) manobraFisicaOK = virar_direita_90_preciso();
+                    
+                    if (manobraFisicaOK) {
+                        idNoAnterior = idParaSerOAnteriorNoProximoPasso; // O nó atual se torna o anterior para o próximo movimento
+                    }
+                    break;
+                case ACAO_DFS_RETROCEDER_180:
+                    broadcastSerialLn("[EM_NO_WEB] DFS decidiu: RETROCEDER_180");
+                    manobraFisicaOK = virar_180_preciso();
+                    // Para retrocesso, dfsManager.processarNoAtual já deve ter atualizado
+                    // idNoAtual (para ser o ID do pai) e idNoAnterior (para ser o ID do nó de onde voltamos).
+                    // A variável 'idParaSerOAnteriorNoProximoPasso' não é usada para setar idNoAnterior neste caso.
+                    break;
+                // ... outros cases (FIM_LABIRINTO, EXPLORACAO_CONCLUIDA, ERRO) ...
+                // Copie do exemplo anterior.
+                case ACAO_DFS_FIM_LABIRINTO:
+                    broadcastSerialLn("FIM DO LABIRINTO ENCONTRADO PELO DFS!");
+                    estadoRoboAtual = PARADO_WEB;
+                    manobraFisicaOK = true;
+                    break;
+                case ACAO_DFS_EXPLORACAO_CONCLUIDA:
+                    broadcastSerialLn("EXPLORAÇÃO DFS CONCLUÍDA!");
+                    estadoRoboAtual = PARADO_WEB;
+                    manobraFisicaOK = true;
+                    break;
+                case ACAO_DFS_ERRO:
+                default:
+                    broadcastSerialLn("ERRO NO DFS OU AÇÃO DESCONHECIDA!");
+                    estadoRoboAtual = PARADO_WEB;
+                    manobraFisicaOK = true; 
+                    break;
+            }
+
+            if (manobraFisicaOK && estadoRoboAtual != PARADO_WEB) {
+                estadoRoboAtual = SEGUINDO_LINHA_WEB;
+            } else if (!manobraFisicaOK) {
+                broadcastSerialLn("[EM_NO_WEB] ERRO na execução da manobra física. Robô PARADO.");
+                estadoRoboAtual = PARADO_WEB;
+            }
+        }
+        break;
         default:
             // Nenhuma variável local inicializada aqui que cause problema
             pararMotoresWebService(); estadoRoboAtual = PARADO_WEB;
