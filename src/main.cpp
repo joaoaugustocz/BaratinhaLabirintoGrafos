@@ -6,7 +6,8 @@
 #include <WebSocketsServer.h> // Para WebSockets
 #include <FS.h>               // Necessário para o sistema de arquivos
 #include <LittleFS.h>         // Usando LittleFS
-
+#include <tipos.h>
+#include <DFSManager.h> // Incluindo o gerenciador de DFS
 
 //------ GRAFOS ------------//
 
@@ -21,7 +22,8 @@ bool primeiroNo = true;     // Flag para tratar o nó inicial
 //------ GRAFOS ------------//
 
 
-
+// --- Instância do DFSManager ---
+DFSManager dfsManager;
 
 
 // --- Configurações de Wi-Fi ---
@@ -37,54 +39,10 @@ WebServer httpServer(80);
 WebSocketsServer webSocketServer = WebSocketsServer(81); // Porta 81 para WebSockets
 
 
-// Padrão bruto observado pelos sensores
-enum TipoDePadraoSensor {
-    PADRAO_LINHA_RETA,        // Sensores centrais ativos, erro PID baixo
-    PADRAO_LINHA_SUMIU_CENTRO, // Sensores centrais brancos
-    PADRAO_LATERAL_ESQUERDA_FORTE, // Sensores externos esquerdos bem ativos
-    PADRAO_LATERAL_DIREITA_FORTE,  // Sensores externos direitos bem ativos
-    PADRAO_MUITOS_SENSORES_PRETOS, // Ex: 4+ sensores pretos
-    PADRAO_QUASE_TUDO_BRANCO,      // Ex: 0 ou 1 sensor preto
-    PADRAO_AMBIGUO             // Outros casos que precisam de confirmação
-};
-
-// Classificação final do nó, após qualquer etapa de confirmação
-enum TipoDeNoFinal {
-    NO_FINAL_NAO_E,
-    NO_FINAL_BECO_SEM_SAIDA,
-    NO_FINAL_CURVA_90_ESQ,
-    NO_FINAL_CURVA_90_DIR,
-    NO_FINAL_T_COM_FRENTE_ESQ,   // Frente e Esquerda
-    NO_FINAL_T_COM_FRENTE_DIR,   // Frente e Direita
-    NO_FINAL_T_SEM_FRENTE,       // Apenas Esquerda e Direita ("pé" do T)
-    NO_FINAL_CRUZAMENTO,         // Frente, Esquerda e Direita
-    NO_FINAL_RETA_SIMPLES,      // Caso especial se quisermos logar
-    NO_FINAL_FIM_DO_LABIRINTO  // <<< NOVO TIPO AQUI
-};
 
 // Variável global para armazenar o tipo de nó após confirmação
 TipoDeNoFinal ultimoNoClassificado = NO_FINAL_NAO_E;
 
-
-
-// === ESTADOS DO ROBÔ PARA CONTROLE WEB ===
-enum EstadoRobo {
-  PARADO_WEB,
-  INICIANDO_EXPLORACAO_WEB,
-  SEGUINDO_LINHA_WEB,
-  
-  PREPARANDO_ANALISE_NO,      // Robô parou, vai iniciar análise
-  AVANCO_POSICIONAMENTO_NO,   // Primeiro avanço curto
-  AVANCO_CHECA_FRENTE_NO,     // Segundo avanço para checar frente
-  CLASSIFICACAO_DETALHADA_NO, // Estado para classificar após os avanços
-  
-  CONFIRMANDO_FIM_DO_LABIRINTO,
-
-  PAUSADO_WEB,
-  EM_NO_WEB, 
-  CALIBRANDO_LINHA_WEB
-  // Remova NODE_DETECTADO_PARANDO, AVANCANDO_BUSCA_LATERAL, AVANCANDO_CHECA_FRENTE, CLASSIFICACAO_FINAL_NO se eram os antigos
-};
 
 // Variáveis Globais para a análise do nó
 bool achouEsquerdaNoPonto1 = false;
@@ -1045,7 +1003,7 @@ void loop()
 
                 primeiroNo = false; // Garante que o nó "Inicio" não seja criado novamente
             }
-            
+
             // Nenhuma variável local inicializada aqui que cause problema
             broadcastSerialLn("WEB: Iniciando Exploração -> Seguindo Linha");
             estadoRoboAtual = SEGUINDO_LINHA_WEB;
