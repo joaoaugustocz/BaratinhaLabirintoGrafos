@@ -27,6 +27,8 @@ bool primeiroNo = true;     // Flag para tratar o nó inicial
 // --- Configurações de Wi-Fi ---
 const char* ssid = "Joao_2G";
 const char* password = "Naotemsenha";
+// const char* ssid = "DevTecnico";
+// const char* password = "EquipeHard#";
 
 // --- Servidor Web HTTP ---
 WebServer httpServer(80);
@@ -76,6 +78,8 @@ enum EstadoRobo {
   AVANCO_CHECA_FRENTE_NO,     // Segundo avanço para checar frente
   CLASSIFICACAO_DETALHADA_NO, // Estado para classificar após os avanços
   
+  CONFIRMANDO_FIM_DO_LABIRINTO,
+
   PAUSADO_WEB,
   EM_NO_WEB, 
   CALIBRANDO_LINHA_WEB
@@ -87,6 +91,8 @@ bool achouEsquerdaNoPonto1 = false;
 bool achouDireitaNoPonto1 = false;
 bool achouFrenteNoPonto2 = false; 
 
+
+TipoDePadraoSensor padraoInicialDetectado;
 
 EstadoRobo estadoRoboAtual = PARADO_WEB;
 bool exploracaoWebIniciada = false;
@@ -111,6 +117,11 @@ const int TEMPO_LEITURA_ESTAVEL_MS = 50; // Pequeno delay para estabilizar leitu
 const int DURACAO_BUSCA_LATERAL_MS = 600;     // Max tempo para achar uma lateral
 const int DURACAO_AVANCO_FRENTE_MS = 200;     // Tempo para avançar e checar a frente
 const int VELOCIDADE_AVANCO_CONFIRM = 40;   // Velocidade para os avanços
+
+const int TEMPO_AVANCO_CONFIRMA_FIM_MS = 300; // Tempo para avançar e confirmar área toda preta (ajuste!)
+// A VELOCIDADE_AVANCO_CONFIRM (40) pode ser usada aqui também, ou uma específica.
+
+TipoDeNoFinal classificacaoPreliminarDoNo = NO_FINAL_NAO_E; 
 
 
 //--------------------------- Motores (Suas Definições)
@@ -186,7 +197,7 @@ const uint16_t setPoint_PID_3sensores = 1000; // Novo setPoint ( (3-1)*1000 / 2 
 QTRSensors qtr;
 const uint8_t SensorCount = 7;
 uint16_t sensorValues[SensorCount];
-#define tempoCalibracaoLinha 120 
+#define tempoCalibracaoLinha 51 
 
 #define s1 GPIO_NUM_1
 #define s2 GPIO_NUM_2
@@ -336,39 +347,78 @@ TipoDePadraoSensor detectarPadraoSensores() {
         if (s[i]) contSensoresPretos++;
     }
 
-    bool pid_frente_forte = s[S_CENTRAL_ESQUERDO] && s[S_CENTRAL_MEIO] && s[S_CENTRAL_DIREITO];
-    bool pid_sem_linha_frente = sensorVeBranco(S_CENTRAL_ESQUERDO) && sensorVeBranco(S_CENTRAL_MEIO) && sensorVeBranco(S_CENTRAL_DIREITO);
-    bool alguma_lateral_ativa = s[S_ESQUERDO_EXTREMO] || s[S_ESQUERDO_INTERNO] || s[S_DIREITO_EXTREMO] || s[S_DIREITO_INTERNO];
+    // Condições para os 3 sensores centrais do PID (S_CENTRAL_ESQUERDO, S_CENTRAL_MEIO, S_CENTRAL_DIREITO)
+    bool pid_linha_nos_3centrais_forte = s[S_CENTRAL_ESQUERDO] || s[S_CENTRAL_MEIO] || s[S_CENTRAL_DIREITO];
+    bool pid_linha_pelo_menos_no_meio = s[S_CENTRAL_MEIO];
+    bool pid_sem_linha_nos_3centrais = sensorVeBranco(S_CENTRAL_ESQUERDO) && 
+                                     sensorVeBranco(S_CENTRAL_MEIO) && 
+                                     sensorVeBranco(S_CENTRAL_DIREITO);
 
-    if (pid_sem_linha_frente && contSensoresPretos <= 1) {
-        return PADRAO_QUASE_TUDO_BRANCO; // Provável Beco sem Saída
+    // Sensores laterais extremos
+    bool lateral_E_extremo_preto = s[S_ESQUERDO_EXTREMO];
+    bool lateral_D_extremo_preto = s[S_DIREITO_EXTREMO];
+    bool alguma_lateral_extrema_ativa = lateral_E_extremo_preto || lateral_D_extremo_preto;
+
+    // --- ORDEM DE DETECÇÃO ---
+
+    // 1. FIM DO LABIRINTO / ÁREA TODA PRETA (MAIOR PRIORIDADE)
+    if (contSensoresPretos >= (SensorCount - 1)) { // Ex: 6 ou 7 dos 7 sensores estão pretos
+        return PADRAO_MUITOS_SENSORES_PRETOS;
     }
 
-    if (pid_frente_forte && !alguma_lateral_ativa && abs(error) < 400) { // Erro do PID 3 sensores
-        return PADRAO_LINHA_RETA; // Linha em frente clara, sem laterais, PID centrado
-    }
-
-    // Qualquer outra situação (muitos sensores pretos, laterais ativas, erro PID grande com laterais)
-    // será tratada como um potencial nó que precisa de confirmação.
-    if (contSensoresPretos >= (SensorCount -1) ) return PADRAO_MUITOS_SENSORES_PRETOS; // Ex: 6 ou 7
-    if (alguma_lateral_ativa && pid_frente_forte) return PADRAO_AMBIGUO; // Frente + Lateral
-    if (alguma_lateral_ativa && !pid_frente_forte) { // Sem frente clara, mas com lateral
-        if (s[S_ESQUERDO_EXTREMO] || s[S_ESQUERDO_INTERNO]) return PADRAO_LATERAL_ESQUERDA_FORTE;
-        if (s[S_DIREITO_EXTREMO] || s[S_DIREITO_INTERNO]) return PADRAO_LATERAL_DIREITA_FORTE;
-    }
-    if (abs(error) > 700) { // Erro grande do PID de 3 sensores, linha perdida para um lado
-         if (error < 0 && (s[S_ESQUERDO_EXTREMO] || s[S_ESQUERDO_INTERNO])) return PADRAO_LATERAL_ESQUERDA_FORTE;
-         if (error > 0 && (s[S_DIREITO_EXTREMO] || s[S_DIREITO_INTERNO])) return PADRAO_LATERAL_DIREITA_FORTE;
+    // 2. BECO SEM SAÍDA CLARO
+    if (pid_sem_linha_nos_3centrais && contSensoresPretos <= 1) { 
+        if (sensorVeBranco(S_ESQUERDO_INTERNO) && sensorVeBranco(S_DIREITO_INTERNO)) { // Confirma com vizinhos
+            return PADRAO_QUASE_TUDO_BRANCO;
+        }
     }
     
-    // Se chegou aqui, mas não é uma linha reta clara, trata como ambíguo para o processo de confirmação
-    // ou pode ser que o PID ainda esteja corrigindo uma curva suave.
-    // Para forçar a checagem se não for uma linha reta perfeita:
-    if (! (pid_frente_forte && !alguma_lateral_ativa && abs(error) < 400) ) {
-        return PADRAO_AMBIGUO;
+    // 3. LINHA RETA (CONDIÇÃO PARA CONTINUAR O PID SEM PARAR)
+    // Se os 3 centrais estão na linha, erro PID baixo, e NENHUM extremo lateral ativo.
+    // if (pid_linha_nos_3centrais_forte && abs(error) < 550 && !alguma_lateral_extrema_ativa) {
+    //     return PADRAO_LINHA_RETA;
+    // }
+    // // Uma condição um pouco mais relaxada para linha reta se o erro estiver pequeno
+    // if (pid_linha_pelo_menos_no_meio && abs(error) < 200 && !alguma_lateral_extrema_ativa && contSensoresPretos >=1 && contSensoresPretos <=3) {
+    //     return PADRAO_LINHA_RETA;
+    // }
+
+    if (pid_linha_nos_3centrais_forte && !alguma_lateral_extrema_ativa) {
+        return PADRAO_LINHA_RETA;
+    }
+    // Uma condição um pouco mais relaxada para linha reta se o erro estiver pequeno
+    if (pid_linha_pelo_menos_no_meio && !alguma_lateral_extrema_ativa && contSensoresPretos >=1 && contSensoresPretos <=3) {
+        return PADRAO_LINHA_RETA;
     }
 
-    return PADRAO_LINHA_RETA; // Default
+
+    // 4. SE NÃO FOR RETA NEM FIM NEM BECO, É UM PADRÃO QUE EXIGE ANÁLISE/CONFIRMAÇÃO
+    // Isso inclui laterais ativas, erros grandes do PID, etc.
+    // A função pid_controlado_web tratará qualquer retorno que não seja PADRAO_LINHA_RETA
+    // como um gatilho para iniciar a análise de nó.
+    // Podemos retornar PADRAO_AMBIGUO como um genérico, ou os padrões laterais específicos.
+
+    if (alguma_lateral_extrema_ativa) {
+        // Se tem lateral E linha em frente, é ambíguo (T, Cruz, início de curva)
+        if (pid_linha_pelo_menos_no_meio) return PADRAO_AMBIGUO;
+        // Se NÃO tem linha em frente clara, e uma lateral está ativa -> forte candidato a curva
+        if (lateral_E_extremo_preto && !lateral_D_extremo_preto) return PADRAO_LATERAL_ESQUERDA_FORTE;
+        if (lateral_D_extremo_preto && !lateral_E_extremo_preto) return PADRAO_LATERAL_DIREITA_FORTE;
+        // Se ambas as laterais e sem frente -> Pé de T
+        if (lateral_E_extremo_preto && lateral_D_extremo_preto) return PADRAO_AMBIGUO; // (Será classificado como T_SEM_FRENTE depois)
+    }
+
+    // Erro grande do PID sugere que a linha está escapando para um lado
+    if (abs(error) > 700) { // Erro do PID de 3 sensores
+        if (error < 0) return PADRAO_LATERAL_ESQUERDA_FORTE; // Tendência à esquerda
+        else return PADRAO_LATERAL_DIREITA_FORTE; // Tendência à direita
+    }
+    
+    // Se chegou até aqui, é uma situação não claramente reta, mas não um padrão lateral óbvio sozinho.
+    // Pode ser uma curva suave que o PID está lidando, mas se o erro não for pequeno,
+    // melhor classificar como ambíguo para forçar uma checagem.
+    // A condição de PADRAO_LINHA_RETA acima já trata os casos de erro pequeno.
+    return PADRAO_AMBIGUO; // Default para qualquer coisa que não seja claramente reta ou um evento já classificado
 }
 
 // --- Função Auxiliar para Converter Enum TipoDeNoFinal para String ---
@@ -389,86 +439,68 @@ String nomeDoNo(TipoDeNoFinal tipo) {
 }
 
 
-bool checarEventoDeParada() {
-    // 'sensorValues' é o array global atualizado por lerSens() -> qtr.readCalibrated()
-    // S_CENTRAL_... e S_EXTREMO... são seus #defines para os índices dos sensores (0 a 6)
-
-    // Condição 1: Beco Sem Saída (inspirado no 3pi: sensors[1,2,3] < 100)
-    // Vamos checar se os 3 sensores centrais do PID estão vendo "branco".
-    bool frenteTotalmenteBrancaPID = sensorVeBranco(S_CENTRAL_ESQUERDO) &&
-                                   sensorVeBranco(S_CENTRAL_MEIO) &&
-                                   sensorVeBranco(S_CENTRAL_DIREITO);
-    
-    // Para ser mais robusto, podemos verificar se QUASE NENHUM sensor vê preto
-    int contSensoresPretos = 0;
-    for (int i = 0; i < SensorCount; i++) {
-        if (sensorVePreto(i)) {
-            contSensoresPretos++;
-        }
-    }
-
-    if (frenteTotalmenteBrancaPID && contSensoresPretos <= 1) { // Se os 3 centrais do PID estão brancos E no máximo 1 sensor no total vê preto
-        broadcastSerialLn("[EventoParada] Detectado: Provável BECO SEM SAÍDA (centrais PID brancos, <=1 preto total)");
-        return true; // Deve parar
-    }
-
-    // Condição 2: Intersecção/Ramificação Lateral (inspirado no 3pi: sensors[0] > 200 || sensors[4] > 200)
-    // Se o sensor MAIS EXTERNO da esquerda OU o MAIS EXTERNO da direita veem preto.
-    // Usamos S_ESQUERDO_EXTREMO (índice 0) e S_DIREITO_EXTREMO (índice 6)
-    if (sensorVePreto(S_ESQUERDO_EXTREMO) || sensorVePreto(S_DIREITO_EXTREMO)) {
-        // Para evitar paradas em curvas muito suaves onde um extremo pode tocar a linha brevemente
-        // enquanto o PID ainda está corrigindo, podemos adicionar uma condição de que o erro do PID
-        // não seja extremo ou que os sensores centrais ainda vejam um pouco da linha.
-        // Por enquanto, vamos manter simples como o 3pi: qualquer extremo ativo para.
-        // Depois podemos refinar se ele parar demais em curvas normais.
-        broadcastSerialLn("[EventoParada] Detectado: Provável INTERSECÇÃO/RAMIFICAÇÃO (sensor extremo ativo)");
-        return true; // Deve parar
-    }
-
-    return false; // Continuar seguindo a linha
-}
-
 void pid_controlado_web() {
     if (estadoRoboAtual != SEGUINDO_LINHA_WEB) return;
 
-    lerSens(); // Atualiza sensorValues e posicaoPID_3sensores
-
-    // Calcula o erro para o PID de 3 sensores
+    lerSens(); 
     second_lastError = lastError;
     lastError = error;
     error = posicaoPID_3sensores - setPoint_PID_3sensores; 
 
-    // --- VERIFICA EVENTO DE PARADA ---
-    if (checarEventoDeParada()) {
-        pararMotoresWebService();
-        I_pid = 0; // Reseta o integral do PID
-        estadoRoboAtual = PREPARANDO_ANALISE_NO; // Muda para o novo estado
-        // Não classificamos o nó final aqui ainda, isso virá depois da análise
-        return; 
+    TipoDePadraoSensor padraoAtual = detectarPadraoSensores(); // Chama a função principal de detecção
+
+    // Se for linha reta, continua o PID
+    if (padraoAtual == PADRAO_LINHA_RETA) {
+        I_pid = I_pid + error;
+        I_pid = constrain(I_pid, -5000, 5000); 
+        int motorSpeedCorrection = current_KP * error + current_KD * (error - lastError) + current_KI * I_pid;
+        
+        int m1Speed_web, m2Speed_web;
+        if (abs(error) <= 100) {
+            m1Speed_web = current_Mm1_reta - motorSpeedCorrection; 
+            m2Speed_web = current_Mm2_reta + motorSpeedCorrection; 
+        } else {
+            m1Speed_web = current_M1_base - motorSpeedCorrection; 
+            m2Speed_web = current_M2_base + motorSpeedCorrection; 
+        }
+        m1Speed_web = constrain(m1Speed_web, current_MMAX2_reverso, current_MMAX_curva);
+        m2Speed_web = constrain(m2Speed_web, current_MMAX2_reverso, current_MMAX_curva);
+        
+        if(m1Speed_web < 0) motor('d', 't', abs(m1Speed_web)); 
+        else motor('d', 'f', abs(m1Speed_web));
+        if(m2Speed_web < 0) motor('e', 't', abs(m2Speed_web));
+        else motor('e', 'f', abs(m2Speed_web));
+        return; // Continua seguindo linha
     }
-    // --- FIM DA VERIFICAÇÃO DE EVENTO DE PARADA ---
-    
-    // Se não houve evento de parada, continua com o PID normal para seguir linha:
-    I_pid = I_pid + error;
-    I_pid = constrain(I_pid, -5000, 5000); 
-    
-    int motorSpeedCorrection = current_KP * error + current_KD * (error - lastError) + current_KI * I_pid;
-    
-    int m1Speed_web, m2Speed_web; // Direito, Esquerdo
-    if (abs(error) <= 100) { // Limiar para "reta" no PID de 3 sensores
-        m1Speed_web = current_Mm1_reta - motorSpeedCorrection; 
-        m2Speed_web = current_Mm2_reta + motorSpeedCorrection; 
-    } else {
-        m1Speed_web = current_M1_base - motorSpeedCorrection; 
-        m2Speed_web = current_M2_base + motorSpeedCorrection; 
+
+    // Se NÃO for PADRAO_LINHA_RETA, é um evento que requer parada e análise.
+    pararMotoresWebService(); 
+    I_pid = 0; 
+    padraoInicialDetectado = padraoAtual; // GUARDA O PADRÃO QUE CAUSOU A PARADA
+
+    // Log do padrão detectado
+    // Para ter o nome do padrão, você precisaria de uma função similar a nomeDoNo() para TipoDePadraoSensor
+    // Ex: String nomePadrao = obterNomeDoPadrao(padraoAtual);
+    // broadcastSerialLn("[PID_CTRL] Padrão detectado: " + nomePadrao + ". Iniciando análise de nó...");
+    broadcastSerialLn("[PID_CTRL] Padrão bruto " + String(padraoAtual) + " detectado. Iniciando análise...");
+
+
+    if (padraoAtual == PADRAO_QUASE_TUDO_BRANCO) {
+        ultimoNoClassificado = NO_FINAL_BECO_SEM_SAIDA;
+        // A mensagem "Decisão Final do Nó" será impressa ao entrar em EM_NO_WEB
+        estadoRoboAtual = EM_NO_WEB; 
+    } 
+    // Adicionado para tratar o FIM diretamente se o padrão for muito claro
+    else if (padraoAtual == PADRAO_MUITOS_SENSORES_PRETOS) {
+        //ultimoNoClassificado = NO_FINAL_FIM_DO_LABIRINTO; // Classifica direto
+        // A mensagem "Decisão Final do Nó" será impressa ao entrar em EM_NO_WEB
+        //estadoRoboAtual = EM_NO_WEB;
+        estadoRoboAtual = PREPARANDO_ANALISE_NO; 
     }
-    m1Speed_web = constrain(m1Speed_web, current_MMAX2_reverso, current_MMAX_curva);
-    m2Speed_web = constrain(m2Speed_web, current_MMAX2_reverso, current_MMAX_curva);
-    
-    if(m1Speed_web < 0) motor('d', 't', abs(m1Speed_web)); 
-    else motor('d', 'f', abs(m1Speed_web));
-    if(m2Speed_web < 0) motor('e', 't', abs(m2Speed_web));
-    else motor('e', 'f', abs(m2Speed_web));
+    else { 
+        // Para outros padrões (AMBIGUO, LATERAL_FORTE), inicia a sequência de confirmação com avanços
+        estadoRoboAtual = PREPARANDO_ANALISE_NO; 
+    }
 }
 
 
@@ -695,11 +727,30 @@ void executarCalibracaoLinhaWebService() {
     motor('e', 'f', 30); 
     motor('d', 't', 30); 
 
-    for (int i = 0; i < tempoCalibracaoLinha; i++) { 
+    for (int i = 0; i < tempoCalibracaoLinha/3; i++) { 
         qtr.calibrate();
         if (i % (tempoCalibracaoLinha / 20) == 0) Serial.print(".");
         delay(20); 
     }
+    pararMotoresWebService(); 
+    motor('e', 't', 30); 
+    motor('d', 'f', 30); 
+
+    for (int i = 0; i < tempoCalibracaoLinha - (tempoCalibracaoLinha/3); i++) { 
+        qtr.calibrate();
+        if (i % (tempoCalibracaoLinha / 20) == 0) Serial.print(".");
+        delay(20); 
+    }
+    pararMotoresWebService(); 
+    motor('e', 'f', 30); 
+    motor('d', 't', 30); 
+
+    for (int i = 0; i < tempoCalibracaoLinha/3; i++) { 
+        qtr.calibrate();
+        if (i % (tempoCalibracaoLinha / 20) == 0) Serial.print(".");
+        delay(20); 
+    }
+
     pararMotoresWebService(); 
     broadcastSerialLn("Calibração de Linha (Web) CONCLUÍDA!");
     setColor('a', 0, 0, 0); FastLED.show();
@@ -980,6 +1031,21 @@ void loop()
             break; 
 
         case INICIANDO_EXPLORACAO_WEB:
+
+            if (primeiroNo) { // Só executa na primeira vez que a exploração é iniciada
+                idNoAnterior = -1; // O nó "Inicio" não tem um anterior
+                idNoAtual = idProximoNo++; // Define o ID para o nó "Inicio"
+
+                String nomeNoInicio = "INICIO_ID" + String(idNoAtual); // Cria um label único
+                broadcastSerialLn("[Grafo] Criando Nó Inicial! ID: " + String(idNoAtual) + ", Label: " + nomeNoInicio);
+
+                // Envia a mensagem para a interface web criar o nó visualmente
+                String msgNode = "newNode:" + String(idNoAtual) + ":" + nomeNoInicio;
+                webSocketServer.broadcastTXT(msgNode);
+
+                primeiroNo = false; // Garante que o nó "Inicio" não seja criado novamente
+            }
+            
             // Nenhuma variável local inicializada aqui que cause problema
             broadcastSerialLn("WEB: Iniciando Exploração -> Seguindo Linha");
             estadoRoboAtual = SEGUINDO_LINHA_WEB;
@@ -1071,25 +1137,107 @@ void loop()
             break;
 
         case CLASSIFICACAO_DETALHADA_NO:
-            broadcastSerialLn("[Classifica] Dados para classificar: EsqP1=" + String(achouEsquerdaNoPonto1) + 
-                                                                " | DirP1=" + String(achouDireitaNoPonto1) + 
-                                                                " | FreP2=" + String(achouFrenteNoPonto2) );
-
-
-            if (achouFrenteNoPonto2) {
-                if (achouEsquerdaNoPonto1 && achouDireitaNoPonto1) ultimoNoClassificado = NO_FINAL_CRUZAMENTO;
-                else if (achouEsquerdaNoPonto1) ultimoNoClassificado = NO_FINAL_T_COM_FRENTE_ESQ;
-                else if (achouDireitaNoPonto1) ultimoNoClassificado = NO_FINAL_T_COM_FRENTE_DIR;
-                else ultimoNoClassificado = NO_FINAL_RETA_SIMPLES; // Linha reta (inesperado aqui, mas é uma saída)
-            } else { // Sem caminho em frente claro após o segundo avanço
-                if (achouEsquerdaNoPonto1 && achouDireitaNoPonto1) ultimoNoClassificado = NO_FINAL_T_SEM_FRENTE; // "Pé" do T
-                else if (achouEsquerdaNoPonto1) ultimoNoClassificado = NO_FINAL_CURVA_90_ESQ;
-                else if (achouDireitaNoPonto1) ultimoNoClassificado = NO_FINAL_CURVA_90_DIR;
-                else ultimoNoClassificado = NO_FINAL_BECO_SEM_SAIDA; 
+        {
+            lerSens(); 
+            
+            bool s_final[SensorCount];
+            int contPretos_final_neste_ponto = 0; // Renomeado para evitar confusão com uma possível global
+            for (int i = 0; i < SensorCount; i++) {
+                s_final[i] = sensorVePreto(i); 
+                if (s_final[i]) contPretos_final_neste_ponto++;
             }
-            broadcastSerialLn("LeituraSensores: \n s3: " + String(sensorValues[2]) + " s4: " + sensorValues[3] + " s5: " + sensorValues[4]);
-            broadcastSerialLn("Decisão Final do Nó: " + nomeDoNo(ultimoNoClassificado));
-            estadoRoboAtual = EM_NO_WEB;
+
+            bool frente_classificada_final = s_final[S_CENTRAL_MEIO] || 
+                                        (s_final[S_CENTRAL_ESQUERDO] || s_final[S_CENTRAL_DIREITO]);
+
+            // Logs de depuração (como você já tem)
+            broadcastSerialLn("[ClassificaDetalhada] Dados: EsqP1=" + String(achouEsquerdaNoPonto1) + 
+                                                        " | DirP1=" + String(achouDireitaNoPonto1) + 
+                                                        " | FreP2_global=" + String(achouFrenteNoPonto2) + // O que foi detectado no avanço anterior
+                                                        " | FreAgora=" + String(frente_classificada_final) + // O que está vendo agora
+                                                        " | PretosAgora=" + String(contPretos_final_neste_ponto) );
+             // Seu log dos valores dos sensores centrais
+            broadcastSerialLn("LeituraSensores em CLASSIFICACAO_DETALHADA_NO: s2=" + String(sensorValues[S_CENTRAL_ESQUERDO]) + 
+                                                                            " s3=" + String(sensorValues[S_CENTRAL_MEIO]) + 
+                                                                            " s4=" + String(sensorValues[S_CENTRAL_DIREITO]));
+
+
+
+            // --- Lógica de Classificação Preliminar ---
+            TipoDeNoFinal tipoNoPreliminar = NO_FINAL_NAO_E; // Variável local para a classificação desta etapa
+
+            if (frente_classificada_final) { // Usa a 'frente_classificada_final' baseada na leitura atual
+                if (achouEsquerdaNoPonto1 && achouDireitaNoPonto1) tipoNoPreliminar = NO_FINAL_CRUZAMENTO;
+                else if (achouEsquerdaNoPonto1) tipoNoPreliminar = NO_FINAL_T_COM_FRENTE_ESQ;
+                else if (achouDireitaNoPonto1) tipoNoPreliminar = NO_FINAL_T_COM_FRENTE_DIR;
+                else tipoNoPreliminar = NO_FINAL_RETA_SIMPLES; 
+            } else { 
+                if (achouEsquerdaNoPonto1 && achouDireitaNoPonto1) tipoNoPreliminar = NO_FINAL_T_SEM_FRENTE; 
+                else if (achouEsquerdaNoPonto1) tipoNoPreliminar = NO_FINAL_CURVA_90_ESQ;
+                else if (achouDireitaNoPonto1) tipoNoPreliminar = NO_FINAL_CURVA_90_DIR;
+                else {
+                    if (contPretos_final_neste_ponto <= 1) { // Se realmente quase nada preto
+                        tipoNoPreliminar = NO_FINAL_BECO_SEM_SAIDA;
+                    } else { // Poucos sensores pretos, mas não claramente um beco (pode ser perda de linha)
+                        broadcastSerialLn("[ClassificaDetalhada] Padrão incerto, poucos pretos, não é beco claro.");
+                        tipoNoPreliminar = NO_FINAL_NAO_E; // Ou um tipo de erro
+                    }
+                }
+            }
+            broadcastSerialLn("[ClassificaDetalhada] Classificação preliminar: " + nomeDoNo(tipoNoPreliminar));
+
+            // --- Checagem Adicional para FIM DO LABIRINTO ---
+            // Se a classificação preliminar é um tipo de intersecção ou reta (onde o robô poderia avançar)
+            // E atualmente está tudo preto, então vamos confirmar se é o FIM.
+            bool condicaoParaChecarFim = (tipoNoPreliminar == NO_FINAL_CRUZAMENTO ||
+                                        tipoNoPreliminar == NO_FINAL_T_COM_FRENTE_ESQ ||
+                                        tipoNoPreliminar == NO_FINAL_T_COM_FRENTE_DIR ||
+                                        tipoNoPreliminar == NO_FINAL_RETA_SIMPLES);
+
+            if (condicaoParaChecarFim && contPretos_final_neste_ponto >= (SensorCount - 1)) { // Ex: 6 ou 7 sensores pretos
+                broadcastSerialLn("[ClassificaDetalhada] Suspeita de FIM DO LABIRINTO (área preta). Avançando para confirmar...");
+                classificacaoPreliminarDoNo = tipoNoPreliminar; // Guarda a classificação caso não seja o FIM
+                estadoRoboAtual = CONFIRMANDO_FIM_DO_LABIRINTO;
+                inicioAvanco = millis(); // Prepara timer para o avanço de confirmação do FIM
+                motor('a', 'f', VELOCIDADE_AVANCO_CONFIRM); // Avança devagar
+            } 
+            // Se não for suspeita de FIM, ou se for um nó que não precisa de mais checagem (curva, beco)
+            else if (tipoNoPreliminar == NO_FINAL_NAO_E || tipoNoPreliminar == NO_FINAL_RETA_SIMPLES) {
+                ultimoNoClassificado = tipoNoPreliminar; // Aceita a classificação
+                estadoRoboAtual = SEGUINDO_LINHA_WEB; 
+                broadcastSerialLn("[ClassificaDetalhada] Decisão: Não é nó para parar / Reta. Retomando seguimento.");
+            } else { // Para Curvas, Becos, T sem Frente (que não são "tudo preto")
+                ultimoNoClassificado = tipoNoPreliminar; // Aceita a classificação
+                estadoRoboAtual = EM_NO_WEB; 
+                // A mensagem "Decisão Final do Nó" será impressa ao entrar em EM_NO_WEB
+            }
+        } 
+            break;
+
+        case CONFIRMANDO_FIM_DO_LABIRINTO:
+            motor('a', 'f', VELOCIDADE_AVANCO_CONFIRM); // Continua avançando devagar
+            
+            if (millis() - inicioAvanco > TEMPO_AVANCO_CONFIRMA_FIM_MS) {
+                pararMotoresWebService();
+                lerSens(); // Leitura final após o avanço extra
+
+                int contPretos_confirmacao_fim = 0;
+                for (int i = 0; i < SensorCount; i++) {
+                    if (sensorVePreto(i)) contPretos_confirmacao_fim++;
+                }
+                broadcastSerialLn("[ConfirmaFIM] Pós avanço extra, Pretos=" + String(contPretos_confirmacao_fim));
+
+                if (contPretos_confirmacao_fim >= (SensorCount - 1)) { // Continua tudo preto?
+                    ultimoNoClassificado = NO_FINAL_FIM_DO_LABIRINTO;
+                    broadcastSerialLn("[ConfirmaFIM] Confirmado: É o FIM DO LABIRINTO!");
+                } else {
+                    // Não era o FIM, era apenas uma área preta que parecia uma intersecção.
+                    // Volta para a classificação que tinha antes de suspeitar do FIM.
+                    ultimoNoClassificado = classificacaoPreliminarDoNo; 
+                    broadcastSerialLn("[ConfirmaFIM] NÃO era o FIM. Revertendo para classificação preliminar: " + nomeDoNo(ultimoNoClassificado));
+                }
+                estadoRoboAtual = EM_NO_WEB; // Vai para EM_NO_WEB para logar o nó e decidir a manobra
+            }
             break;
 
         case PAUSADO_WEB: 
@@ -1097,6 +1245,7 @@ void loop()
             break;
          case EM_NO_WEB:
             {
+            broadcastSerialLn("Decisão Final do Nó: " + nomeDoNo(ultimoNoClassificado));
             // A mensagem "Decisão Final do Nó: ..." já foi impressa.
             // Este é o ponto onde o robô PAROU e CLASSIFICOU um nó.
 
@@ -1182,7 +1331,7 @@ void loop()
             } 
             else if (ultimoNoClassificado == NO_FINAL_RETA_SIMPLES) {  
                 broadcastSerialLn("[DFS] Reta simples detectada pós-confirmação. Seguindo em FRENTE.");
-                motor('a', 'f', VELOCIDADE_AJUSTE_FINAL); delay(TEMPO_AJUSTE_FINAL_MS); pararMotoresWebService();
+                motor('a', 'f', VELOCIDADE_AJUSTE_FINAL); //delay(TEMPO_AJUSTE_FINAL_MS); pararMotoresWebService();
                 manobraExecutada = true; 
             } 
             else if (ultimoNoClassificado == NO_FINAL_CURVA_90_DIR) {
