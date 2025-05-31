@@ -1,16 +1,14 @@
 // src/DFSManager.cpp
 #include "DFSManager.h"
+#include "Baratinha.h"
 
 // Supondo que broadcastSerialLn está em main.cpp e você quer usá-la para debug aqui
 // Para fazer isso corretamente, você precisaria de uma declaração extern ou passar uma função de log.
 // Por enquanto, vamos usar broadcastSerialLn para simplicidade nos stubs.
-extern void broadcastSerialLn(const String &message);
-
-DFSManager::DFSManager() {
+DFSManager::DFSManager(Baratinha& braRef) : _bra(braRef) {
     idProximoNoUnico = 0;
     resetarDFS();
 }
-
 void DFSManager::resetarDFS() {
     contadorNosRegistrados = 0;
     idProximoNoUnico = 0;
@@ -26,11 +24,11 @@ void DFSManager::resetarDFS() {
         nosDoLabirinto[i].exploradoDireita = false;
         nosDoLabirinto[i].totalmenteExplorado = false;
     }
-    //broadcastSerialLn("[DFSManager] DFS Resetado.");
+    //_bra.bcSerialln("[DFSManager] DFS Resetado.");
 }
 
 void DFSManager::iniciarNovaExploracao(int idNoInicial, TipoDeNoFinal tipoNoInicial, bool temFrenteInicial) {
-    broadcastSerialLn(String("[DFSManager] Iniciando nova exploração. Nó inicial ID: ") + idNoInicial);
+    _bra.bcSerialln(String("[DFSManager] Iniciando nova exploração. Nó inicial ID: ") + idNoInicial);
     resetarDFS(); // Garante que tudo está limpo
 
     // Registra o nó inicial no DFS
@@ -64,7 +62,7 @@ NodeInfo* DFSManager::encontrarNodeInfoPeloID(int id) {
 
 NodeInfo* DFSManager::registrarNovoNoInterno(int idNovo, int idPai, TipoDeNoFinal tipo, bool esq, bool fren, bool dir) {
     if (contadorNosRegistrados >= MAX_NODES_DFS) {
-        broadcastSerialLn("[DFSManager] ERRO: Sem slots para novos nós!");
+        _bra.bcSerialln("[DFSManager] ERRO: Sem slots para novos nós!");
         return nullptr;
     }
     NodeInfo* novo = &nosDoLabirinto[contadorNosRegistrados++]; // Usa e depois incrementa
@@ -80,7 +78,7 @@ NodeInfo* DFSManager::registrarNovoNoInterno(int idNovo, int idPai, TipoDeNoFina
     novo->exploradoDireita = false;
     novo->totalmenteExplorado = false;
 
-    broadcastSerialLn(String("[DFSManager] Nó Registrado/Atualizado ID: ") + novo->id + ", Tipo: " + (int)novo->tipoNo + ", Pai: " + novo->idPaiDFS);
+    _bra.bcSerialln(String("[DFSManager] Nó Registrado/Atualizado ID: ") + novo->id + ", Tipo: " + (int)novo->tipoNo + ", Pai: " + novo->idPaiDFS);
     return novo;
 }
 
@@ -91,7 +89,7 @@ NodeInfo* DFSManager::registrarNovoNoInterno(int idNovo, int idPai, TipoDeNoFina
 // Supondo que você tem uma função para converter TipoDeNoFinal para String para os logs,
 // similar à nomeDoNo() do main.cpp, ou use Serial.print((int)tipoNo) para debug.
 // Para os logs do DFSManager, vou usar (int)tipoNo para simplificar.
-// Se broadcastSerialLn está em main.cpp, use Serial.println para logs internos do DFSManager,
+// Se broadcastSerialLn está em main.cpp, use _bra.bcSerialln para logs internos do DFSManager,
 // ou configure uma forma de chamar broadcastSerialLn (ex: extern ou callback de log).
 
 // ... (outros métodos do DFSManager como construtor, resetarDFS, iniciarNovaExploracao,
@@ -108,7 +106,7 @@ AcaoDFS DFSManager::processarNoAtual(
     void (*callbackNovoNoWeb)(int id, TipoDeNoFinal tipo, int idPai),
     void (*callbackArestaWeb)(int idOrigem, int idDestino, const char* label)
 ) {
-    Serial.println(String("[DFSManager::processarNoAtual] INICIO - ID Candidato/Atual Recebido: ") + idNoProcessado +
+    _bra.bcSerialln(String("[DFSManager::processarNoAtual] INICIO - ID Candidato/Atual Recebido: ") + idNoProcessado +
                    ", ID Pai Recebido (de onde vim): " + idPaiDoProximoNo +
                    ", Tipo Detectado Fisicamente: " + (int)tipoNoDetectado_param);
 
@@ -131,7 +129,7 @@ AcaoDFS DFSManager::processarNoAtual(
         );
 
         if (!infoNodeParaTrabalhar) {
-            Serial.println("[DFSManager::processarNoAtual] ERRO: Falha ao registrar novo nó!");
+            _bra.bcSerialln("[DFSManager::processarNoAtual] ERRO: Falha ao registrar novo nó!");
             return ACAO_DFS_ERRO;
         }
 
@@ -139,7 +137,7 @@ AcaoDFS DFSManager::processarNoAtual(
         idProximoNoUnico++;                      // Incrementa o contador interno do DFSManager
         foiNovoNoDescoberto = true;
 
-        Serial.println(String("[DFSManager::processarNoAtual] Novo nó DFS registrado. ID DFS: ") + infoNodeParaTrabalhar->id +
+        _bra.bcSerialln(String("[DFSManager::processarNoAtual] Novo nó DFS registrado. ID DFS: ") + infoNodeParaTrabalhar->id +
                        ", Pai DFS: " + infoNodeParaTrabalhar->idPaiDFS +
                        ", Tipo: " + (int)infoNodeParaTrabalhar->tipoNo);
 
@@ -155,7 +153,7 @@ AcaoDFS DFSManager::processarNoAtual(
     } else {
         // Estamos revisitando um nó DFS existente (idNoProcessado já era um ID DFS válido).
         // Isso geralmente acontece após um backtrack, onde idNoProcessado foi definido para o ID do pai.
-        Serial.println(String("[DFSManager::processarNoAtual] Revisitando nó DFS existente. ID: ") + infoNodeParaTrabalhar->id +
+        _bra.bcSerialln(String("[DFSManager::processarNoAtual] Revisitando nó DFS existente. ID: ") + infoNodeParaTrabalhar->id +
                        ", Tipo Armazenado: " + (int)infoNodeParaTrabalhar->tipoNo +
                        ", Pai DFS: " + infoNodeParaTrabalhar->idPaiDFS);
         // Para um nó revisitado, usamos suas informações ARMAZENADAS de tipo e saídas,
@@ -180,9 +178,9 @@ AcaoDFS DFSManager::processarNoAtual(
         logMsg += String(infoNodeParaTrabalhar->exploradoFrente) + "/";
         logMsg += String(infoNodeParaTrabalhar->exploradoDireita);
         logMsg += " | Totalmente Explorado: " + String(infoNodeParaTrabalhar->totalmenteExplorado);
-        broadcastSerialLn(logMsg); // Ou Serial.println(logMsg);
+        _bra.bcSerialln(logMsg); // Ou _bra.bcSerialln(logMsg);
     } else {
-        broadcastSerialLn("[DFSManager DEBUG] ERRO: infoNodeParaTrabalhar é NULO antes da decisão!");
+        _bra.bcSerialln("[DFSManager DEBUG] ERRO: infoNodeParaTrabalhar é NULO antes da decisão!");
         return ACAO_DFS_ERRO;
     }
     // <<< FIM DOS LOGS DE DEPURAÇÃO >>>
@@ -191,61 +189,59 @@ AcaoDFS DFSManager::processarNoAtual(
 
     // Se o tipo ARMAZENADO do nó é um ponto terminal para exploração A PARTIR DELE:
     if (infoNodeParaTrabalhar->tipoNo == NO_FINAL_BECO_SEM_SAIDA ||
-        infoNodeParaTrabalhar->tipoNo == NO_FINAL_FIM_DO_LABIRINTO) { // FIM também causa backtrack para exploração completa
+        infoNodeParaTrabalhar->tipoNo == NO_FINAL_FIM_DO_LABIRINTO) { 
 
         infoNodeParaTrabalhar->totalmenteExplorado = true;
-        Serial.println(String("[DFSManager::processarNoAtual] Nó ID: ") + infoNodeParaTrabalhar->id +
+        _bra.bcSerialln(String("[DFSManager::processarNoAtual] Nó ID: ") + infoNodeParaTrabalhar->id +
                        " é BECO ou FIM. Marcado para retroceder (totalmente explorado).");
-        // A lógica de retrocesso será tratada abaixo.
     } else {
-        // Se NÃO FOR BECO NEM FIM (conforme tipo armazenado), tenta explorar saídas
-        // usando as saídas ARMAZENADAS quando o nó foi descoberto/registrado.
+        // Se NÃO FOR BECO NEM FIM, tenta explorar saídas
+        // Adicione este log extra para depuração IMEDIATAMENTE ANTES DOS IFs de decisão de caminho
+        _bra.bcSerialln(String("[DFS CondCheck] Nó:") + infoNodeParaTrabalhar->id +
+                       " sE:" + infoNodeParaTrabalhar->saidaDisponivelEsquerda + ",!eE:" + !infoNodeParaTrabalhar->exploradoEsquerda +
+                       " sF:" + infoNodeParaTrabalhar->saidaDisponivelFrente + ",!eF:" + !infoNodeParaTrabalhar->exploradoFrente +
+                       " sD:" + infoNodeParaTrabalhar->saidaDisponivelDireita + ",!eD:" + !infoNodeParaTrabalhar->exploradoDireita);
+
         if (infoNodeParaTrabalhar->saidaDisponivelEsquerda && !infoNodeParaTrabalhar->exploradoEsquerda) {
             infoNodeParaTrabalhar->exploradoEsquerda = true;
-            idPaiDoProximoNo = infoNodeParaTrabalhar->id; // O nó atual se torna o pai do próximo (que será descoberto)
-            Serial.println(String("[DFSManager::processarNoAtual] Nó ID: ") + infoNodeParaTrabalhar->id + " Decisão: ESQUERDA.");
-            return ACAO_DFS_VIRAR_ESQUERDA;
+            // idPaiDoProximoNo = infoNodeParaTrabalhar->id; // Removido conforme sua última alteração
+            _bra.bcSerialln(String("[DFSManager::processarNoAtual] Nó ID: ") + infoNodeParaTrabalhar->id + " Decisão: ESQUERDA.");
+            return ACAO_DFS_VIRAR_ESQUERDA; // <<< ESSENCIAL
         }
         if (infoNodeParaTrabalhar->saidaDisponivelFrente && !infoNodeParaTrabalhar->exploradoFrente) {
             infoNodeParaTrabalhar->exploradoFrente = true;
-            idPaiDoProximoNo = infoNodeParaTrabalhar->id;
-            Serial.println(String("[DFSManager::processarNoAtual] Nó ID: ") + infoNodeParaTrabalhar->id + " Decisão: FRENTE.");
-            return ACAO_DFS_SEGUIR_FRENTE;
+            // idPaiDoProximoNo = infoNodeParaTrabalhar->id; // Removido
+            _bra.bcSerialln(String("[DFSManager::processarNoAtual] Nó ID: ") + infoNodeParaTrabalhar->id + " Decisão: FRENTE.");
+            return ACAO_DFS_SEGUIR_FRENTE; // <<< ESSENCIAL
         }
         if (infoNodeParaTrabalhar->saidaDisponivelDireita && !infoNodeParaTrabalhar->exploradoDireita) {
             infoNodeParaTrabalhar->exploradoDireita = true;
-            idPaiDoProximoNo = infoNodeParaTrabalhar->id;
-            Serial.println(String("[DFSManager::processarNoAtual] Nó ID: ") + infoNodeParaTrabalhar->id + " Decisão: DIREITA.");
-            return ACAO_DFS_VIRAR_DIREITA;
+            // idPaiDoProximoNo = infoNodeParaTrabalhar->id; // Removido
+            _bra.bcSerialln(String("[DFSManager::processarNoAtual] Nó ID: ") + infoNodeParaTrabalhar->id + " Decisão: DIREITA.");
+            return ACAO_DFS_VIRAR_DIREITA; // <<< ESSENCIAL
         }
     }
 
-    // Se chegou aqui:
-    // 1. Era um BECO ou FIM (já marcado como totalmenteExplorado).
-    // 2. Ou era um nó de passagem (Cruzamento, T) e todas as suas saídas disponíveis já foram exploradas.
-    infoNodeParaTrabalhar->totalmenteExplorado = true; // Garante que está marcado
-    Serial.println(String("[DFSManager::processarNoAtual] Nó ID: ") + infoNodeParaTrabalhar->id + " agora é considerado totalmente explorado.");
+    // Se chegou aqui: ou era BECO/FIM, ou todas as saídas foram exploradas.
+    infoNodeParaTrabalhar->totalmenteExplorado = true; 
+    _bra.bcSerialln(String("[DFSManager::processarNoAtual] Nó ID: ") + infoNodeParaTrabalhar->id + " agora é considerado totalmente explorado (caiu para backtrack).");
 
     if (infoNodeParaTrabalhar->idPaiDFS != -1) { // Se tem um pai para onde retroceder
-        Serial.println(String("[DFSManager::processarNoAtual] Retrocedendo do Nó DFS ID: ") + infoNodeParaTrabalhar->id +
+        _bra.bcSerialln(String("[DFSManager::processarNoAtual] Retrocedendo do Nó DFS ID: ") + infoNodeParaTrabalhar->id +
                        " para o Pai DFS ID: " + infoNodeParaTrabalhar->idPaiDFS);
-
-        // Prepara para o retrocesso:
-        // O "nó atual" do main.cpp (idNoProcessado) se torna o ID do pai (nosso destino).
-        idNoProcessado = infoNodeParaTrabalhar->idPaiDFS;
-        // O "nó anterior" do main.cpp (idPaiDoProximoNo) se torna este nó (de onde estamos voltando fisicamente).
-        idPaiDoProximoNo = infoNodeParaTrabalhar->id;
+        idNoProcessado = infoNodeParaTrabalhar->idPaiDFS;     // Atualiza ref para main::idNoAtual
+        idPaiDoProximoNo = infoNodeParaTrabalhar->id;      // Atualiza ref para main::idNoAnterior
         return ACAO_DFS_RETROCEDER_180;
     } else {
-        // Nó raiz (INICIO ou nó sem pai) e totalmente explorado.
-        Serial.println(String("[DFSManager::processarNoAtual] Nó inicial/raiz DFS ID: ") + infoNodeParaTrabalhar->id +
+        // Nó raiz (INICIO) e totalmente explorado.
+        _bra.bcSerialln(String("[DFSManager::processarNoAtual] Nó inicial/raiz DFS ID: ") + infoNodeParaTrabalhar->id +
                        " totalmente explorado. Fim da exploração DFS.");
         return ACAO_DFS_EXPLORACAO_CONCLUIDA;
     }
 }
 
 int DFSManager::obterProximoIDParaNovoNo() {
-    broadcastSerialLn("[DFSManager] obterProximoIDParaNovoNo chamado - ESTA FUNÇÃO PODE SER REMOVIDA SE O DFS GERENCIA INTERNAMENTE.");
+    _bra.bcSerialln("[DFSManager] obterProximoIDParaNovoNo chamado - ESTA FUNÇÃO PODE SER REMOVIDA SE O DFS GERENCIA INTERNAMENTE.");
     // Esta função pode não ser necessária se o DFSManager gerenciar os IDs internamente
     // e os comunicar via callbacks ou atualizando idNoProcessado.
     // Por enquanto, vamos retornar o contador interno, mas a lógica de ID precisa ser consistente.

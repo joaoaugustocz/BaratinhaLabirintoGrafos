@@ -1,7 +1,8 @@
 // src/Baratinha.cpp
 #include "Baratinha.h"
+#include <stdarg.h> 
 
-Baratinha::Baratinha() {
+Baratinha::Baratinha(WebSocketsServer& ws) : _webSocketServer(ws) {
     // Construtor pode ser vazio se a inicialização principal for nos métodos setupXxx()
 }
 
@@ -45,16 +46,38 @@ void Baratinha::calibrarSensoresLinha(int duracaoGiroMs) {
         qtr.calibrate();
         delay(20);
     }
+    pararMotores();
 
     mover('e', 't', 30);
     mover('d', 'f', 30);
     inicioCalib = millis();
-    while(millis() - inicioCalib < (unsigned long)duracaoGiroMs / 2) {
+    while(millis() - inicioCalib < (unsigned long)duracaoGiroMs) {
+        qtr.calibrate();
+        delay(20);
+    }
+    pararMotores();
+    mover('e', 'f', 30);
+    mover('d', 't', 30);
+    inicioCalib = millis();
+    while(millis() - inicioCalib < (unsigned long)duracaoGiroMs/2) {
         qtr.calibrate();
         delay(20);
     }
     pararMotores();
     setCorLEDs('a', 0,0,0);
+
+    bcSerialln("Valores minimos (Web Calib):");
+
+    for (uint8_t i = 0; i < QTR_SENSOR_COUNT; i++) 
+    { 
+        bcSerial(String(qtr.calibrationOn.minimum[i]) + " ");
+    }
+    bcSerialln("Valores maximos (Web Calib):");
+    for (uint8_t i = 0; i < QTR_SENSOR_COUNT; i++) 
+    { 
+        bcSerial(String(qtr.calibrationOn.maximum[i]) + " "); 
+    }
+    bcSerialln(" ");
     // broadcastSerialLn("Calibração de Sensores Concluída.");
     // Você pode querer que este método retorne os valores min/max ou os imprima.
 }
@@ -123,7 +146,7 @@ void Baratinha::pararMotores() {
 }
 
 void Baratinha::girar90GrausEsquerda(bool preciso) {
-    // broadcastSerialLn("[Baratinha] Girando 90 Esq...");
+    bcSerialln("[Baratinha] Girando 90 Esq...");
     pararMotores();
     delay(100);
     // Adapte sua lógica de virar_esquerda_90_preciso() para cá
@@ -154,7 +177,7 @@ void Baratinha::girar90GrausEsquerda(bool preciso) {
         delay(_TEMPO_AJUSTE_POS_VIRADA_MS);
         pararMotores();
     } else {
-        // broadcastSerialLn("[Baratinha] ERRO ao girar 90 Esq.");
+        bcSerialln("[Baratinha] ERRO ao girar 90 Esq.");
     }
 }
 // Implemente girar90GrausDireita e girar180Graus de forma similar...
@@ -210,4 +233,27 @@ void Baratinha::setCorLEDs(char qualLed, int h, int s, int v) {
     FastLED.show();
 }
 
+void Baratinha::bcSerial(const String &message) {
+    Serial.print(message); // Mantém o log no Serial Monitor
+    String nonConstMessage = message;
+    _webSocketServer.broadcastTXT(nonConstMessage); // Envia via WebSocket
+}
+
+void Baratinha::bcSerialln(const String &message) {
+    Serial.println(message); // Mantém o log no Serial Monitor
+    String nonConstMessage = message + "\n";
+    _webSocketServer.broadcastTXT(nonConstMessage); // Envia via WebSocket
+}
+
+void Baratinha::bcSerialF(const char *format, ...) {
+    char buf[256]; // Buffer para a string formatada
+    va_list args;
+    va_start(args, format);
+    vsnprintf(buf, sizeof(buf), format, args);
+    va_end(args);
+
+    Serial.print(buf); // Mantém o log no Serial Monitor
+    String messageToSend = String(buf);
+    _webSocketServer.broadcastTXT(messageToSend); // Envia via WebSocket
+}
 // ... Implemente outros métodos ...

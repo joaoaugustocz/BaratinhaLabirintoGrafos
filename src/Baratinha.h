@@ -3,9 +3,10 @@
 #define BARATINHA_H
 
 #include <Arduino.h>
-#include <QTRSensors.h> // Se a leitura dos sensores QTR ficar aqui
-#include <FastLED.h>    // Se o controle dos LEDs ficar aqui
-#include "tipos.h"      // Para enums como TipoDeNoFinal, se necessário para alguma lógica interna
+#include <WebSocketsServer.h>
+#include <QTRSensors.h>
+#include <FastLED.h>
+#include "tipos.h"
 
 // --- Constantes e Definições de Pinos (podem vir para cá ou serem passadas no construtor) ---
 // Motores
@@ -38,12 +39,18 @@ const uint8_t QTR_SENSOR_COUNT = 7;
 class Baratinha {
 public:
     Baratinha(); // Construtor
+    Baratinha(WebSocketsServer& ws);
+
+    // --- MÉTODOS DE LOG ---
+    void bcSerial(const String &message);
+    void bcSerialln(const String &message);
+    void bcSerialF(const char *format, ...); // Para formatação estilo printf
 
     // --- Métodos de Configuração (chamados no setup() do main.cpp) ---
     void setupMotores();
     void setupSensoresLinha();
     void setupLEDs();
-    void calibrarSensoresLinha(int duracaoGiroMs = 2000); // Exemplo com parâmetro
+    void calibrarSensoresLinha(int duracaoGiroMs = 1000); // Exemplo com parâmetro
 
     // --- Métodos de Movimentação ---
     void mover(char motorLado, char direcao, int pwm); // 'e', 'd', 'a' (ambos); 'f', 't'; pwm
@@ -65,6 +72,9 @@ public:
     // ... (qualquer outra função que seja específica do hardware/comportamento do robô) ...
 
 private:
+
+    WebSocketsServer& _webSocketServer; // Referência ao servidor WebSocket
+
     QTRSensors qtr; // Objeto QTR fica encapsulado aqui
     uint16_t qtrValoresSensores[QTR_SENSOR_COUNT]; // Buffer interno para os sensores
     CRGB ledsInternos[NUM_LEDS_BARATINHA];        // Buffer interno para LEDs
