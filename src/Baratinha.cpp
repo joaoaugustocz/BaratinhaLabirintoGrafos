@@ -95,6 +95,7 @@ String Baratinha::nomeDoNo(TipoDeNoFinal tipo) { //
         case NO_FINAL_CRUZAMENTO: return "CRUZAMENTO";
         case NO_FINAL_RETA_SIMPLES: return "RETA_SIMPLES_POS_CONFIRMACAO"; // Para o caso pós-confirmação
         case NO_FINAL_FIM_DO_LABIRINTO: return "FIM_DO_LABIRINTO"; // <<< ADICIONAR
+        case NO_INICIO:               return "INICIO";
         default: return "NO_DESCONHECIDO (" + String(tipo) + ")";
     }
 }
@@ -163,6 +164,7 @@ void Baratinha::pararMotores() {
 
 void Baratinha::girar90GrausEsquerda(bool preciso) {
     bcSerialln("[Baratinha] Girando 90 Esq...");
+
     pararMotores();
     delay(100);
     // Adapte sua lógica de virar_esquerda_90_preciso() para cá

@@ -25,7 +25,8 @@ enum TipoDeNoFinal {
     NO_FINAL_T_SEM_FRENTE,
     NO_FINAL_CRUZAMENTO,
     NO_FINAL_RETA_SIMPLES,
-    NO_FINAL_FIM_DO_LABIRINTO
+    NO_FINAL_FIM_DO_LABIRINTO,
+    NO_INICIO               = 99
 };
 
 enum DirecaoGlobal {

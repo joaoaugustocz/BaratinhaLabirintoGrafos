@@ -57,7 +57,7 @@ public:
     void setupMotores();
     void setupSensoresLinha();
     void setupLEDs();
-    void calibrarSensoresLinha(int duracaoGiroMs = 600); // Exemplo com parâmetro
+    void calibrarSensoresLinha(int duracaoGiroMs = 750); // Exemplo com parâmetro
 
     // --- Métodos de Movimentação ---
     void mover(char motorLado, char direcao, int pwm); // 'e', 'd', 'a' (ambos); 'f', 't'; pwm
