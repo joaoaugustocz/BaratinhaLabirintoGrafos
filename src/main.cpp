@@ -1,15 +1,13 @@
 #include <Arduino.h>
-#include "Baratinha.h" 
-#include "DFSManager.h" 
-#include <FastLED.h>
-#include <QTRSensors.h>
 #include <WiFi.h>
+#include "Baratinha.h" 
 #include <WebServer.h>
-#include <WebSocketsServer.h> 
 #include <FS.h>               
 #include <LittleFS.h>        
 #include "tipos.h"
 #include <headers.h>
+#include <set>                 // Para std::set
+#include "DFS.h"       // Incluindo a classe DFS
 
 #define wifi1
 //#define wifi2
@@ -21,14 +19,17 @@ Baratinha bra(webSocketServer);
 
 //------ GRAFOS ------------//
 
-// Variáveis globais para o mapeamento simples
-int idProximoNo = 0;        // Contador para gerar IDs de nós únicos
-int idNoAtual = -1;         // ID do nó onde o robô está ou acabou de classificar
-int idNoAnterior = -1;      // ID do nó de onde o robô veio para chegar ao nó atual
-bool primeiroNo = true;     // Flag para tratar o nó inicial
+DFS dfs(bra); // Instância do DFS
+AcaoDFS ultimaAcaoDFSPlanejada; // << ADICIONE ESTA LINHA
 
-// --- Instância do DFSManager ---
-DFSManager dfsManager(bra);
+// --- Variáveis de Controle do Mapeamento DFS ---
+int idNoAtualWeb = 0;
+int idNoAnteriorWeb = -1;
+int idProximoNoWeb = 1;
+bool primeiroNoDaExploracao = true;
+std::set<int> nosCriadosVisualmente; // Para evitar criar nós duplicados na interface
+TipoDePadraoSensor padraoInicialDetectadoGlobal; // Padrão que causou a parada do PID
+DirecaoGlobal direcaoArestaExecutada; // Direção global da última aresta seguida
 
 // --- Configurações de Wi-Fi ---
 #ifdef wifi1
@@ -55,7 +56,7 @@ bool achouFrenteNoPonto2 = false;
 
 TipoDePadraoSensor padraoInicialDetectado;
 
-EstadoRobo estadoRoboAtual = PARADO_WEB;
+EstadoRobo estadoRobo = PRINC_PARADO;
 bool exploracaoWebIniciada = false;
 
 bool lateralEsquerdaEncontradaBusca = false;
@@ -87,14 +88,14 @@ TipoDeNoFinal classificacaoPreliminarDoNo = NO_FINAL_NAO_E;
 int posicao = 0; 
 
 #define KP_3 0.1
-#define KI_3 0.001//0.0003
-#define KD_3 0.1//1.75
-#define M1_BASE_3 30 
-#define M2_BASE_3 30  
-#define Mm1_RETA_3 30 
-#define Mm2_RETA_3 30 
-#define MMAX_CURVA_3 80
-#define MMAX2_REVERSO_3 -90
+#define KI_3 0.000//0.001//0.0003
+#define KD_3 0.0//1.75
+#define M1_BASE_3 40 
+#define M2_BASE_3 40  
+#define Mm1_RETA_3 40 
+#define Mm2_RETA_3 40 
+#define MMAX_CURVA_3 70
+#define MMAX2_REVERSO_3 -30
 
 
 int error = 0;
@@ -237,11 +238,14 @@ void setup() {
     }
 
     //httpServer.on("/", HTTP_GET, handleRoot);
-    httpServer.on("/iniciar", HTTP_GET, handleIniciarWeb); 
+    
+    // httpServer.on("/iniciar", HTTP_GET, handleIniciarWeb); 
     httpServer.on("/retornar", HTTP_GET, handleRetornarWeb);
     httpServer.on("/pausar", HTTP_GET, handlePausarWeb);
     httpServer.on("/continuar", HTTP_GET, handleContinuarWeb);
     httpServer.on("/recalibrar_linha", HTTP_GET, handleRecalibrarLinhaWeb);
+    httpServer.on("/iniciar", HTTP_GET, handleIniciarMapeamentoDFS); 
+    //httpServer.on("/iniciar_dfs", HTTP_GET, handleIniciarMapeamentoDFS);
     httpServer.onNotFound([]() {
         if (!handleFileRead(httpServer.uri())) {
             // Se handleFileRead retornar false, o arquivo realmente não foi encontrado ou não pôde ser aberto.
@@ -260,13 +264,10 @@ void setup() {
     bra.setupMotores();
     bra.setupSensoresLinha();
 
-   
-    dfsManager.resetarDFS(); // Importante para limpar o estado do DFS
-    bra.bcSerialln("DFS Manager resetado no setup.");
 
     Serial.println("Fim setup. Robô pronto em estado PARADO_WEB.");
     bra.bcSerialln("Fim setup. Robô pronto em estado PARADO_WEB.");
-    estadoRoboAtual = PARADO_WEB;
+    estadoRobo = PRINC_PARADO;
     bra.setCorLEDs('a', 200, 255, 100); FastLED.show(); delay(500); bra.setCorLEDs('a', 0,0,0); FastLED.show();
     bra.bcSerialln("Robô Bartinha Finalizou o Setup!"); // Exemplo de uso
 }
@@ -277,367 +278,209 @@ void loop()
     httpServer.handleClient(); 
     webSocketServer.loop();    
 
-    switch (estadoRoboAtual) {
-        case PARADO_WEB:
-            pararMotoresWebService(); 
-            // Nenhuma variável local inicializada aqui que cause problema
-            break; 
-
-        case INICIANDO_EXPLORACAO_WEB:
-            if (primeiroNo) 
-            { // 'primeiroNo' é a sua flag global
-                idNoAnterior = -1;       // Correto para o nó INICIO (não tem pai na lógica do main)
-                idNoAtual = idProximoNo++; // idNoAtual recebe o ID do INICIO (ex: 0), idProximoNo avança (ex: para 1)
-
-                String nomeNoInicio = "INICIO_ID" + String(idNoAtual);
-                bra.bcSerialln("[Grafo] Criando Nó Inicial! ID: " + String(idNoAtual) + ", Label: " + nomeNoInicio);
-                String msgNode = "newNode:" + String(idNoAtual) + ":" + nomeNoInicio;
-                webSocketServer.broadcastTXT(msgNode);
-
-                // Informa o DFSManager. NO_FINAL_RETA_SIMPLES é um tipo placeholder para o INICIO.
-                // 'true' para temFrenteInicial indica que a partir do INICIO, o robô vai "em frente".
-                dfsManager.iniciarNovaExploracao(idNoAtual, NO_FINAL_RETA_SIMPLES, true);
-                
-                primeiroNo = false;
-            }
-
-
-            // Nenhuma variável local inicializada aqui que cause problema
-            bra.bcSerialln("WEB: Iniciando Exploração -> Seguindo Linha");
-            idNoAnterior = idNoAtual; 
-            estadoRoboAtual = SEGUINDO_LINHA_WEB;
-            lateralEsquerdaEncontradaBusca = false;
-            lateralDireitaEncontradaBusca = false;
+    switch (estadoRobo) {
+        case PRINC_PARADO:
+            bra.pararMotores();
+            // Aguarda comando para iniciar (ex: via WebSocket ou HTTP)
             break;
 
-        case SEGUINDO_LINHA_WEB:
-            // Nenhuma variável local inicializada aqui que cause problema
-            pid_controlado_web(); 
+        case PRINC_SEGUINDO_LINHA_DFS:
+            pid_controlado_web();
+            //executar_pid_seguindo_linha_dfs();
             break;
 
-       
-
-          case PREPARANDO_ANALISE_NO:
-            pararMotoresWebService(); // Garante que parou completamente
-            achouEsquerdaNoPonto1 = false; // Reseta flags
-            achouDireitaNoPonto1 = false;
-            achouFrenteNoPonto2 = false;
-            
-            bra.bcSerialln("[AnalisaNó] Fase 1: Iniciando avanço curto para posicionamento...");
-            inicioAvanco = millis();
-            bra.mover('a', 'f', VELOCIDADE_POSICIONAMENTO); // Começa a avançar
-            estadoRoboAtual = AVANCO_POSICIONAMENTO_NO;
+        case PRINC_PROCESSANDO_NO_DFS: 
+            pid_controlado_web();
             break;
+        // {
+        //     bra.pararMotores(); // Garante que está parado
+        //     bra.bcSerialln("[MAIN_DFS] Processando Nó Atual ID_Web: " + String(idNoAtualWeb));
 
-        case AVANCO_POSICIONAMENTO_NO:
-            if (millis() - inicioAvanco >= TEMPO_POSICIONAMENTO_NO_MS) {
-                pararMotoresWebService();
-                bra.bcSerialln("[AnalisaNó] Avanço de posicionamento concluído. Lendo laterais...");
-                delay(TEMPO_LEITURA_ESTAVEL_MS); // Espera um pouco para sensores estabilizarem
-                lerSens(); // Atualiza sensorValues
+        //     // 1. Identificar o tipo de nó físico onde o robô está
+        //     // padraoInicialDetectadoGlobal foi setado quando o PID parou
+        //     ResultadoIdentificacaoBaratinha resNo = bra.identificarTipoDeNo(padraoInicialDetectadoGlobal);
+        //     TipoDeNoFinal tipoNoFisico = resNo.tipo;
+        //     bra.bcSerialln(String("[MAIN_DFS] Nó Físico Identificado: ") + bra.nomeDoNo(tipoNoFisico) +
+        //                    " Saidas E/F/D: " + resNo.temSaidaEsquerda + "/" + resNo.temSaidaFrente + "/" + resNo.temSaidaDireita);
 
-                // Checa saídas laterais (sensores extremos 0 e 6)
-                if (sensorVePreto(S_ESQUERDO_EXTREMO)) {
-                    achouEsquerdaNoPonto1 = true;
-                }
-                if (sensorVePreto(S_DIREITO_EXTREMO)) {
-                    achouDireitaNoPonto1 = true;
-                }
-                bra.bcSerialln("[AnalisaNó] Ponto 1 - Esquerda: " + String(achouEsquerdaNoPonto1) + " | Direita: " + String(achouDireitaNoPonto1));
+        //     // 2. Enviar info do nó para a interface web (criar nó e aresta de chegada)
+        //     if (nosCriadosVisualmente.find(idNoAtualWeb) == nosCriadosVisualmente.end()) {
+        //         callbackParaCriarNoWeb(idNoAtualWeb, tipoNoFisico, idNoAnteriorWeb); // idNoAnteriorWeb é o pai VISUAL
+        //         nosCriadosVisualmente.insert(idNoAtualWeb);
+        //     }
+        //     if (!primeiroNoDaExploracao && idNoAnteriorWeb != -1) { // Não desenha aresta para o primeiro nó
+        //         callbackParaCriarArestaWeb(idNoAnteriorWeb, idNoAtualWeb, String((int)direcaoArestaExecutada).c_str());
+        //     }
 
-                // Prepara para o próximo avanço (checar frente)
-                bra.bcSerialln("[AnalisaNó] Fase 2: Iniciando avanço para checar frente...");
-                inicioAvanco = millis();
-                bra.mover('a', 'f', VELOCIDADE_CHECA_FRENTE);
-                estadoRoboAtual = AVANCO_CHECA_FRENTE_NO;
-            } else {
-                 bra.mover('a', 'f', VELOCIDADE_POSICIONAMENTO); // Continua avançando se o tempo não acabou
-            }
-            break;
+        //     // 3. Se for o primeiro nó, iniciar o DFS
+        //     if (primeiroNoDaExploracao) {
+        //         bra.orientacaoAtualRobo = NORTE; // DFS começa virado para o NORTE
+        //         dfs.iniciar(idNoAtualWeb, tipoNoFisico, resNo.temSaidaEsquerda, resNo.temSaidaFrente, resNo.temSaidaDireita);
+        //         primeiroNoDaExploracao = false;
+        //     }
 
-        case AVANCO_CHECA_FRENTE_NO:
-            if (millis() - inicioAvanco >= TEMPO_CHECA_FRENTE_NO_MS) {
-                pararMotoresWebService();
-                bra.bcSerialln("[AnalisaNó] Avanço para checar frente concluído. Lendo frente...");
-                delay(TEMPO_LEITURA_ESTAVEL_MS);
-                lerSens();
+        //     // 4. Consultar o DFS para a próxima ação
+        //     ResultadoAcaoDFS decisaoDFS = dfs.proximaAcao(idNoAtualWeb, tipoNoFisico,
+        //                                                   resNo.temSaidaEsquerda, resNo.temSaidaFrente, resNo.temSaidaDireita);
 
-                // --- DEBUG DETALHADO AQUI ---
-                bool sCE = sensorVePreto(S_CENTRAL_ESQUERDO); // sensorValues[2]
-                bool sCM = sensorVePreto(S_CENTRAL_MEIO);     // sensorValues[3]
-                bool sCD = sensorVePreto(S_CENTRAL_DIREITO);  // sensorValues[4]
+        //     // 5. Preparar para a próxima manobra e atualizar IDs para o próximo estado
+        //     idNoAnteriorWeb = idNoAtualWeb; // O nó atual se torna o anterior para o próximo movimento
+        //     direcaoArestaExecutada = decisaoDFS.direcaoGlobalParaSeguir; // Guarda a direção que será tomada
 
-                bra.bcSerialln("[DEBUG ChecaFrente] Valores Brutos Centrais: S2=" + String(sensorValues[S_CENTRAL_ESQUERDO]) + 
-                                                                " S3=" + String(sensorValues[S_CENTRAL_MEIO]) + 
-                                                                " S4=" + String(sensorValues[S_CENTRAL_DIREITO]));
-                bra.bcSerialln("[DEBUG ChecaFrente] sensorVePreto Resultados: sCE=" + String(sCE) + 
-                                                                        " sCM=" + String(sCM) + 
-                                                                        " sCD=" + String(sCD));
-                // --- FIM DO DEBUG DETALHADO ---
+        //     switch (decisaoDFS.acao) {
+        //         case ACAO_DFS_SEGUIR_FRENTE:
+        //         case ACAO_DFS_VIRAR_ESQUERDA:
+        //         case ACAO_DFS_VIRAR_DIREITA:
+        //             if (decisaoDFS.idNoDestino != -1) { // DFS indicou um nó de destino conhecido
+        //                 idNoAtualWeb = decisaoDFS.idNoDestino;
+        //             } else { // DFS está explorando um caminho novo, main gera novo ID
+        //                 idNoAtualWeb = idProximoNoWeb++;
+        //             }
+        //             estadoRobo = PRINC_EXECUTANDO_MANOBRA_DFS;
+        //             break;
+        //         case ACAO_DFS_RETROCEDER_180:
+        //             idNoAtualWeb = decisaoDFS.idNoDestino; // DFS DEVE fornecer o ID do nó para o qual está voltando
+        //             estadoRobo = PRINC_EXECUTANDO_MANOBRA_DFS;
+        //             break;
+        //         case ACAO_DFS_FIM_LABIRINTO:
+        //             bra.bcSerialln("[MAIN_DFS] FIM DO LABIRINTO ALCANÇADO!");
+        //             // Poderia ter uma animação de LEDs aqui
+        //             estadoRobo = PRINC_MAPEAMENTO_CONCLUIDO_DFS;
+        //             break;
+        //         case ACAO_DFS_EXPLORACAO_CONCLUIDA:
+        //             bra.bcSerialln("[MAIN_DFS] EXPLORAÇÃO DFS CONCLUÍDA!");
+        //             estadoRobo = PRINC_MAPEAMENTO_CONCLUIDO_DFS;
+        //             break;
+        //         case ACAO_DFS_ERRO:
+        //             bra.bcSerialln("[MAIN_DFS] ERRO NA LÓGICA DFS!");
+        //             estadoRobo = PRINC_ERRO_DFS;
+        //             break;
+        //     }
+        //     // Se não mudou para concluído/erro, vai para executar manobra
+        //     break;
+        // }
 
-                // Checa caminho à frente (sensores centrais do PID: 2, 3, 4)
-                // Uma condição mais robusta: pelo menos o central E um dos vizinhos, ou todos os 3
-                if (sensorVePreto(S_CENTRAL_MEIO) || 
-                    (sensorVePreto(S_CENTRAL_ESQUERDO) || sensorVePreto(S_CENTRAL_DIREITO)) ) {
-                    achouFrenteNoPonto2 = true;
-                }
-                // Ou, se os 3 estiverem pretos:
-                // if (sensorVePreto(S_CENTRAL_ESQUERDO) && sensorVePreto(S_CENTRAL_MEIO) && sensorVePreto(S_CENTRAL_DIREITO)) {
-                //    achouFrenteNoPonto2 = true;
-                // }
-                bra.bcSerialln("[AnalisaNó] Ponto 2 - Frente: " + String(achouFrenteNoPonto2));
-                
-                estadoRoboAtual = CLASSIFICACAO_DETALHADA_NO;
-            } else {
-                bra.mover('a', 'f', VELOCIDADE_CHECA_FRENTE); // Continua avançando
-            }
-            break;
+        // case PRINC_EXECUTANDO_MANOBRA_DFS: {
+        //     // Ação já foi decidida em decisaoDFS.acao (precisa ser guardada numa var global se não for passada)
+        //     // Vamos supor que `ultimaAcaoPlanejadaPeloDFS` e `direcaoGlobalArestaPlanejada` foram setadas.
+        //     // Para este exemplo, vamos buscar a ação do DFS novamente (não ideal, melhor guardar)
+        //     // A maneira correta é `ultimaAcaoPlanejadaPeloDFS` ter sido definida no estado anterior.
+        //     // Para simplificar, assumimos que `decisaoDFS.acao` está disponível de alguma forma.
+        //     // No exemplo anterior, `direcaoArestaExecutada` guarda a direção global e `idNoAtualWeb` o destino.
+        //     // A manobra específica (virar_esq, etc.) é `decisaoDFS.acao`.
+        //     // Vamos assumir que decisaoDFS.acao está numa variável global `ultimaAcaoDFSPlanejada`.
 
-        case CLASSIFICACAO_DETALHADA_NO:
-        {
-            lerSens(); 
-            
-            bool s_final[SensorCount];
-            int contPretos_final_neste_ponto = 0; // Renomeado para evitar confusão com uma possível global
-            for (int i = 0; i < SensorCount; i++) {
-                s_final[i] = sensorVePreto(i); 
-                if (s_final[i]) contPretos_final_neste_ponto++;
-            }
+        //     AcaoDFS manobra = ultimaAcaoDFSPlanejada; // Esta variável deve ser setada em PROCESSANDO_NO_DFS
 
-            bool frente_classificada_final = s_final[S_CENTRAL_MEIO] || 
-                                        (s_final[S_CENTRAL_ESQUERDO] || s_final[S_CENTRAL_DIREITO]);
+        //     bra.bcSerialln("[MAIN_DFS] Executando Manobra: " + String(manobra) + " para encarar Global: " + String(direcaoArestaExecutada));
 
-            // Logs de depuração (como você já tem)
-            bra.bcSerialln("[ClassificaDetalhada] Dados: EsqP1=" + String(achouEsquerdaNoPonto1) + 
-                                                        " | DirP1=" + String(achouDireitaNoPonto1) + 
-                                                        " | FreP2_global=" + String(achouFrenteNoPonto2) + // O que foi detectado no avanço anterior
-                                                        " | FreAgora=" + String(frente_classificada_final) + // O que está vendo agora
-                                                        " | PretosAgora=" + String(contPretos_final_neste_ponto) );
-             // Seu log dos valores dos sensores centrais
-            bra.bcSerialln("LeituraSensores em CLASSIFICACAO_DETALHADA_NO: s2=" + String(sensorValues[S_CENTRAL_ESQUERDO]) + 
-                                                                            " s3=" + String(sensorValues[S_CENTRAL_MEIO]) + 
-                                                                            " s4=" + String(sensorValues[S_CENTRAL_DIREITO]));
+        //     switch (manobra) { // Use a ação que foi determinada pelo DFS
+        //         case ACAO_DFS_SEGUIR_FRENTE:
+        //             bra.atualizarOrientacaoAposVirada(ACAO_DFS_SEGUIR_FRENTE); // Não vira, mas atualiza se necessário
+        //             break;
+        //         case ACAO_DFS_VIRAR_ESQUERDA:
+        //             bra.girar90GrausEsquerda(true);
+        //             bra.atualizarOrientacaoAposVirada(ACAO_DFS_VIRAR_ESQUERDA);
+        //             break;
+        //         case ACAO_DFS_VIRAR_DIREITA:
+        //             bra.girar90GrausDireita(true);
+        //             bra.atualizarOrientacaoAposVirada(ACAO_DFS_VIRAR_DIREITA);
+        //             break;
+        //         case ACAO_DFS_RETROCEDER_180: // Esta ação implica virar 180 E depois seguir em frente
+        //             bra.girar180Graus(true);
+        //             bra.atualizarOrientacaoAposVirada(ACAO_DFS_RETROCEDER_180);
+        //             break;
+        //         default: // Outros casos (FIM, CONCLUIDO, ERRO) não deveriam chegar aqui
+        //             bra.bcSerialln("[MAIN_DFS] Manobra inesperada em EXECUTANDO_MANOBRA_DFS.");
+        //             break;
+        //     }
+        //     // Após a manobra, o robô está orientado. Próximo passo é seguir linha.
+        //     estadoRobo = PRINC_SEGUINDO_LINHA_DFS;
+        //     break;
+        // }
 
-
-
-            // --- Lógica de Classificação Preliminar ---
-            TipoDeNoFinal tipoNoPreliminar = NO_FINAL_NAO_E; // Variável local para a classificação desta etapa
-
-            if (frente_classificada_final) { // Usa a 'frente_classificada_final' baseada na leitura atual
-                if (achouEsquerdaNoPonto1 && achouDireitaNoPonto1) tipoNoPreliminar = NO_FINAL_CRUZAMENTO;
-                else if (achouEsquerdaNoPonto1) tipoNoPreliminar = NO_FINAL_T_COM_FRENTE_ESQ;
-                else if (achouDireitaNoPonto1) tipoNoPreliminar = NO_FINAL_T_COM_FRENTE_DIR;
-                else tipoNoPreliminar = NO_FINAL_RETA_SIMPLES; 
-            } else { 
-                if (achouEsquerdaNoPonto1 && achouDireitaNoPonto1) tipoNoPreliminar = NO_FINAL_T_SEM_FRENTE; 
-                else if (achouEsquerdaNoPonto1) tipoNoPreliminar = NO_FINAL_CURVA_90_ESQ;
-                else if (achouDireitaNoPonto1) tipoNoPreliminar = NO_FINAL_CURVA_90_DIR;
-                else {
-                    if (contPretos_final_neste_ponto <= 1) { // Se realmente quase nada preto
-                        tipoNoPreliminar = NO_FINAL_BECO_SEM_SAIDA;
-                    } else { // Poucos sensores pretos, mas não claramente um beco (pode ser perda de linha)
-                        bra.bcSerialln("[ClassificaDetalhada] Padrão incerto, poucos pretos, não é beco claro.");
-                        tipoNoPreliminar = NO_FINAL_NAO_E; // Ou um tipo de erro
-                    }
-                }
-            }
-            bra.bcSerialln("[ClassificaDetalhada] Classificação preliminar: " + nomeDoNo(tipoNoPreliminar));
-
-            // --- Checagem Adicional para FIM DO LABIRINTO ---
-            // Se a classificação preliminar é um tipo de intersecção ou reta (onde o robô poderia avançar)
-            // E atualmente está tudo preto, então vamos confirmar se é o FIM.
-            bool condicaoParaChecarFim = (tipoNoPreliminar == NO_FINAL_CRUZAMENTO ||
-                                        tipoNoPreliminar == NO_FINAL_T_COM_FRENTE_ESQ ||
-                                        tipoNoPreliminar == NO_FINAL_T_COM_FRENTE_DIR ||
-                                        tipoNoPreliminar == NO_FINAL_RETA_SIMPLES);
-
-            if (condicaoParaChecarFim && contPretos_final_neste_ponto >= (SensorCount - 1)) { // Ex: 6 ou 7 sensores pretos
-                bra.bcSerialln("[ClassificaDetalhada] Suspeita de FIM DO LABIRINTO (área preta). Avançando para confirmar...");
-                classificacaoPreliminarDoNo = tipoNoPreliminar; // Guarda a classificação caso não seja o FIM
-                estadoRoboAtual = CONFIRMANDO_FIM_DO_LABIRINTO;
-                inicioAvanco = millis(); // Prepara timer para o avanço de confirmação do FIM
-                bra.mover('a', 'f', VELOCIDADE_AVANCO_CONFIRM); // Avança devagar
-            } 
-            // Se não for suspeita de FIM, ou se for um nó que não precisa de mais checagem (curva, beco)
-            else if (tipoNoPreliminar == NO_FINAL_NAO_E || tipoNoPreliminar == NO_FINAL_RETA_SIMPLES) {
-                ultimoNoClassificado = tipoNoPreliminar; // Aceita a classificação
-                estadoRoboAtual = SEGUINDO_LINHA_WEB; 
-                bra.bcSerialln("[ClassificaDetalhada] Decisão: Não é nó para parar / Reta. Retomando seguimento.");
-            } else { // Para Curvas, Becos, T sem Frente (que não são "tudo preto")
-                ultimoNoClassificado = tipoNoPreliminar; // Aceita a classificação
-                estadoRoboAtual = EM_NO_WEB; 
-                // A mensagem "Decisão Final do Nó" será impressa ao entrar em EM_NO_WEB
-            }
-        } 
-            break;
-
-        case CONFIRMANDO_FIM_DO_LABIRINTO:
-            bra.mover('a', 'f', VELOCIDADE_AVANCO_CONFIRM); // Continua avançando devagar
-            
-            if (millis() - inicioAvanco > TEMPO_AVANCO_CONFIRMA_FIM_MS) {
-                pararMotoresWebService();
-                lerSens(); // Leitura final após o avanço extra
-
-                int contPretos_confirmacao_fim = 0;
-                for (int i = 0; i < SensorCount; i++) {
-                    if (sensorVePreto(i)) contPretos_confirmacao_fim++;
-                }
-                bra.bcSerialln("[ConfirmaFIM] Pós avanço extra, Pretos=" + String(contPretos_confirmacao_fim));
-
-                if (contPretos_confirmacao_fim >= (SensorCount - 1)) { // Continua tudo preto?
-                    ultimoNoClassificado = NO_FINAL_FIM_DO_LABIRINTO;
-                    bra.bcSerialln("[ConfirmaFIM] Confirmado: É o FIM DO LABIRINTO!");
-                } else {
-                    // Não era o FIM, era apenas uma área preta que parecia uma intersecção.
-                    // Volta para a classificação que tinha antes de suspeitar do FIM.
-                    ultimoNoClassificado = classificacaoPreliminarDoNo; 
-                    bra.bcSerialln("[ConfirmaFIM] NÃO era o FIM. Revertendo para classificação preliminar: " + nomeDoNo(ultimoNoClassificado));
-                }
-                estadoRoboAtual = EM_NO_WEB; // Vai para EM_NO_WEB para logar o nó e decidir a manobra
-            }
-            break;
-
-        case PAUSADO_WEB: 
-            // Nenhuma variável local inicializada aqui que cause problema
-            break;
-        case EM_NO_WEB:
-        {
-            // idNoAnterior (global) é o ID do nó de onde viemos (ex: 0 para o INICIO).
-            // ultimoNoClassificado é o tipo do local físico ATUAL.
-            // achouEsquerdaNoPonto1, etc., são as saídas do local físico ATUAL.
-
-            int idParaProcessarNoDFS;
-            int idPaiParaDFS = idNoAnterior; // De onde viemos é o pai do nó atual, se for novo. CORRETO.
-
-            // Lógica para determinar idParaProcessarNoDFS:
-            // Esta lógica visa distinguir entre descobrir um novo local físico
-            // ou reprocessar um nó DFS existente (ex: após um backtrack).
-            if (idNoAtual == idNoAnterior && idNoAnterior != -1 && primeiroNo == false) { 
-                // Condição: Estamos parados, e o "nó atual" (antes desta análise) era o mesmo que o "nó anterior".
-                // E não é a primeira vez que saímos do nó INICIO (primeiroNo == false).
-                // Isso geralmente significa que acabamos de sair de idNoAnterior, paramos,
-                // e este novo local físico deve obter um novo ID candidato.
-                idParaProcessarNoDFS = idProximoNo; // Usa o próximo ID da interface como candidato. CORRETO.
-            } else {
-                // Cenários para este else:
-                // 1. É a primeira parada após o INICIO (idNoAtual=0, idNoAnterior=0, mas primeiroNo=true ainda não foi setado para false *aqui*, ou era -1).
-                //    Na sua lógica de INICIANDO_EXPLORACAO_WEB, primeiroNo é setado para false e idNoAnterior = idNoAtual.
-                //    Então, na primeira parada real, idNoAtual e idNoAnterior serão iguais ao ID do INICIO.
-                // 2. O idNoAtual foi explicitamente definido para um nó existente pelo DFSManager
-                //    (ex: após um backtrack, idNoAtual se torna o ID do pai).
-                idParaProcessarNoDFS = idNoAtual; // Processa o nó que o main.cpp acredita ser o atual. CORRETO.
-            }
-            // A adição de "&& primeiroNo == false" no if é uma boa salvaguarda para o primeiro nó após o INICIO.
-
-            bra.bcSerialln(String("[EM_NO_WEB PRE-CHECK] idNoAtual: ") + idNoAtual + 
-               ", idNoAnterior: " + idNoAnterior + 
-               ", idProximoNo: " + idProximoNo + 
-               ", primeiroNo: " + primeiroNo);
-
-            bra.bcSerialln("EM_NO_WEB - Candidato ID p/ DFS: " + String(idParaProcessarNoDFS) +
-                        ", Pai Potencial (Vindo de): " + String(idPaiParaDFS) +
-                        ", Tipo Detectado: " + nomeDoNo(ultimoNoClassificado));
-
-            AcaoDFS acaoDecidida = dfsManager.processarNoAtual(
-                idParaProcessarNoDFS,  // Passado por referência. Será ATUALIZADO pelo DFSManager com o ID DFS real.
-                idPaiParaDFS,          // Passado por referência. Será ATUALIZADO pelo DFSManager no backtrack.
-                ultimoNoClassificado,
-                achouEsquerdaNoPonto1,
-                achouFrenteNoPonto2,
-                achouDireitaNoPonto1,
-                callbackParaCriarNoWeb,
-                callbackParaCriarArestaWeb
-            );
-
-            // Após a chamada, idParaProcessarNoDFS agora contém o ID DFS real (novo ou existente)
-            // do nó que foi efetivamente processado pelo DFSManager.
-            idNoAtual = idParaProcessarNoDFS; // Atualiza o idNoAtual global do main.cpp. CORRETO.
-            idNoAnterior = idPaiParaDFS;
-
-            // Sincroniza o contador de idProximoNo do main.cpp com os IDs usados pelo DFS.
-            if (idNoAtual >= idProximoNo) {
-                idProximoNo = idNoAtual + 1; // Garante que o próximo ID da interface seja novo. CORRETO.
-            }
-
-            // idParaSerOAnteriorNoProximoPasso guarda o ID do nó que acabamos de processar e de onde
-            // partiremos se a ação for de avanço (L, F, R).
-            int idParaSerOAnteriorNoProximoPasso = idNoAtual; 
-
-            bool manobraFisicaOK = false;
-            switch (acaoDecidida) {
-                case ACAO_DFS_VIRAR_ESQUERDA:
-                case ACAO_DFS_SEGUIR_FRENTE:
-                case ACAO_DFS_VIRAR_DIREITA:
-                    bra.bcSerialln(String("[EM_NO_WEB] DFS decidiu AVANÇAR/VIRAR a partir do Nó ") + idParaSerOAnteriorNoProximoPasso); // Log com o ID de origem
-                    if (acaoDecidida == ACAO_DFS_VIRAR_ESQUERDA) manobraFisicaOK = virar_esquerda_90_preciso();
-                    else if (acaoDecidida == ACAO_DFS_SEGUIR_FRENTE) manobraFisicaOK = true;
-                    else if (acaoDecidida == ACAO_DFS_VIRAR_DIREITA) manobraFisicaOK = virar_direita_90_preciso();
-                    
-                    if (manobraFisicaOK) {
-                        // Se o robô vai se mover para um novo local (ou seguir linha),
-                        // o nó que ele acabou de processar (idParaSerOAnteriorNoProximoPasso)
-                        // se torna o idNoAnterior para a *próxima* vez que ele parar.
-                        idNoAnterior = idParaSerOAnteriorNoProximoPasso; 
-                    }
-                    break;
-                case ACAO_DFS_RETROCEDER_180:
-                    // No retrocesso, 'idNoAtual' foi atualizado pelo DFSManager para ser o ID do nó PAI (destino).
-                    // 'idPaiParaDFS' (que era 'idNoAnterior' do main) foi atualizado pelo DFSManager
-                    // para ser o ID do nó FILHO (de onde estamos vindo).
-                    bra.bcSerialln(String("[EM_NO_WEB] DFS decidiu RETROCEDER_180 do Nó ") + idPaiParaDFS + " para o Nó " + idNoAtual);
-                    manobraFisicaOK = virar_180_preciso();
-                    // idNoAtual e idNoAnterior JÁ FORAM ATUALIZADOS POR REFERÊNCIA pelo DFSManager.
-                    // idNoAtual -> é o pai (para onde vamos)
-                    // idNoAnterior -> é o filho (de onde viemos)
-                    // Não é necessário fazer: idNoAnterior = idParaSerOAnteriorNoProximoPasso;
-                    break;
-                
-                case ACAO_DFS_FIM_LABIRINTO: // Se você quer que ele continue explorando após achar um FIM
-                    bra.bcSerialln(String("[EM_NO_WEB] DFS encontrou FIM_DO_LABIRINTO no Nó ") + idParaSerOAnteriorNoProximoPasso + ". DFS deve decidir retroceder.");
-                    // A lógica no DFSManager::processarNoAtual foi ajustada para tratar FIM_DO_LABIRINTO
-                    // como um beco, marcando-o como totalmente explorado e então disparando a lógica de retrocesso.
-                    // Portanto, o DFSManager deve ter retornado ACAO_DFS_RETROCEDER_180 neste caso,
-                    // e este case ACAO_DFS_FIM_LABIRINTO não deveria mais ser o ponto final da decisão.
-                    // Se ele ainda for atingido, é um sinal de que o DFSManager não está tratando FIM para retroceder.
-                    // Vamos assumir que o DFSManager *vai* retornar ACAO_DFS_RETROCEDER_180.
-                    // Se, por algum motivo, ele *ainda* retorna ACAO_DFS_FIM_LABIRINTO e você quer que continue:
-                    // manobraFisicaOK = virar_180_preciso(); // Forçaria o retrocesso
-                    // idNoAnterior = idParaSerOAnteriorNoProximoPasso; // Prepara para o próximo estado
-                    // Mas é melhor que o DFSManager já retorne ACAO_DFS_RETROCEDER_180.
-                    // Por segurança, se este case for atingido e o objetivo é continuar explorando:
-                    bra.bcSerialln("ALERTA: DFS retornou ACAO_DFS_FIM_LABIRINTO, mas a exploração deveria continuar. Verifique DFSManager.");
-                    estadoRoboAtual = PARADO_WEB; // Parar para investigar
-                    manobraFisicaOK = true;
-                    break;
-
-                case ACAO_DFS_EXPLORACAO_CONCLUIDA:
-                    bra.bcSerialln("EXPLORAÇÃO DFS CONCLUÍDA!");
-                    estadoRoboAtual = PARADO_WEB;
-                    manobraFisicaOK = true;
-                    break;
-                case ACAO_DFS_ERRO:
-                default:
-                    bra.bcSerialln("ERRO NO DFS OU AÇÃO DESCONHECIDA!");
-                    estadoRoboAtual = PARADO_WEB;
-                    manobraFisicaOK = true; 
-                    break;
-            }
-
-            if (manobraFisicaOK && estadoRoboAtual != PARADO_WEB) {
-                estadoRoboAtual = SEGUINDO_LINHA_WEB;
-            } else if (!manobraFisicaOK) {
-                bra.bcSerialln("[EM_NO_WEB] ERRO na execução da manobra física. Robô PARADO.");
-                estadoRoboAtual = PARADO_WEB;
-            }
-        }
-        break;
-        default:
-            // Nenhuma variável local inicializada aqui que cause problema
-            pararMotoresWebService(); estadoRoboAtual = PARADO_WEB;
-            bra.bcSerialln("[AVISO] Estado desconhecido, robô parado.");
-            break;
+        // case PRINC_MAPEAMENTO_CONCLUIDO_DFS:
+        // case PRINC_ERRO_DFS:
+        //     bra.pararMotores();
+        //     // Pode piscar LEDs ou enviar mensagem final
+        //     // Aguarda reset ou novo comando
+        //     break;
     }
-    delay(20); 
+
+    // switch (estadoRobo) {
+    //     case PARADO_WEB:
+    //         pararMotoresWebService(); 
+    //         break; 
+
+    //     case INICIANDO_EXPLORACAO_WEB:
+    //         estadoRobo = SEGUINDO_LINHA_WEB;
+
+    //         break;
+        
+    //     case SEGUINDO_LINHA_WEB:
+        
+    //         // Nenhuma variável local inicializada aqui que cause problema
+    //         pid_controlado_web(); 
+    //         break;
+
+    //     case PAUSADO_WEB: 
+    //         pararMotoresWebService(); 
+    //         // Nenhuma variável local inicializada aqui que cause problema
+    //         break;
+    // }
+}
+
+void executar_pid_seguindo_linha_dfs() {
+    lerSens(); // Popula sensorValues e posicaoPID_3sensores
+
+    // Sua lógica de cálculo de erro PID (pode copiar de pid_controlado_web)
+    // ATENÇÃO: As variáveis 'error', 'lastError', 'second_lastError', 'I_pid' são globais.
+    // Certifique-se de que elas estão sendo gerenciadas corretamente.
+    second_lastError = lastError;
+    lastError = error;
+    error = posicaoPID_3sensores - setPoint_PID_3sensores;
+
+    // Filtros ou ajustes no erro (copiado de pid_controlado_web)
+    if(abs(error - lastError) > 300 && abs(error) > 500 ) error = lastError/2; // Reduz saltos grandes no erro, dividi por 2 para suavizar
+    if(bra.sensorVePreto(S_CENTRAL_MEIO) && bra.sensorVePreto(S_CENTRAL_DIREITO) && bra.sensorVePreto(S_CENTRAL_ESQUERDO)) {
+        error = 0;
+    }
+    if(bra.sensorVePreto(S_CENTRAL_MEIO) && (bra.sensorVePreto(S_DIREITO_INTERNO) || bra.sensorVePreto(S_ESQUERDO_INTERNO))) {
+        error = 0;
+    }
+
+    TipoDePadraoSensor padraoAtual = detectarPadraoSensores(); // Usa 'error' global
+
+    if (padraoAtual == PADRAO_LINHA_RETA) {
+        // Lógica de controle PID para os motores (copie de pid_controlado_web)
+        I_pid = I_pid + error;
+        I_pid = constrain(I_pid, -5000, 5000); // Limita o termo integral
+        int motorSpeedCorrection = current_KP * error + current_KD * (error - lastError) + current_KI * I_pid;
+
+        int m1Speed, m2Speed; // Renomeado para clareza
+        if (abs(error) <= 100) { // Se o erro é pequeno, usa velocidades de reta
+            m1Speed = current_Mm1_reta - motorSpeedCorrection; // Motor Direito
+            m2Speed = current_Mm2_reta + motorSpeedCorrection; // Motor Esquerdo
+        } else { // Erro maior, usa velocidades base de curva
+            m1Speed = current_M1_base - motorSpeedCorrection;
+            m2Speed = current_M2_base + motorSpeedCorrection;
+        }
+
+        m1Speed = constrain(m1Speed, current_MMAX2_reverso, current_MMAX_curva);
+        m2Speed = constrain(m2Speed, current_MMAX2_reverso, current_MMAX_curva);
+
+        if(m1Speed < 0) bra.mover('d', 't', abs(m1Speed));
+        else bra.mover('d', 'f', abs(m1Speed));
+        if(m2Speed < 0) bra.mover('e', 't', abs(m2Speed));
+        else bra.mover('e', 'f', abs(m2Speed));
+    } else {
+        // Evento detectado! Não é mais linha reta.
+        bra.pararMotores();
+        padraoInicialDetectadoGlobal = padraoAtual; // Guarda o padrão que causou a parada
+        I_pid = 0; // Reseta o termo integral do PID
+        bra.bcSerialln(String("[PID_DFS] Evento: ") + (int)padraoAtual + ". Parando para processar nó.");
+        estadoRobo = PRINC_PROCESSANDO_NO_DFS; // Muda para o estado de processar o nó
+    }
 }
 
 void lerSens() 
@@ -806,33 +649,27 @@ TipoDePadraoSensor detectarPadraoSensores() {
     return PADRAO_AMBIGUO; // Default para qualquer coisa que não seja claramente reta ou um evento já classificado
 }
 
-// --- Função Auxiliar para Converter Enum TipoDeNoFinal para String ---
-String nomeDoNo(TipoDeNoFinal tipo) {
-    switch (tipo) {
-        case NO_FINAL_NAO_E: return "NAO_E_NO_FINAL"; // Renomeado para clareza
-        case NO_FINAL_BECO_SEM_SAIDA: return "BECO_SEM_SAIDA";
-        case NO_FINAL_CURVA_90_ESQ: return "CURVA_90_ESQ";
-        case NO_FINAL_CURVA_90_DIR: return "CURVA_90_DIR";
-        case NO_FINAL_T_COM_FRENTE_ESQ: return "T_FRENTE_ESQ";
-        case NO_FINAL_T_COM_FRENTE_DIR: return "T_FRENTE_DIR";
-        case NO_FINAL_T_SEM_FRENTE: return "T_SEM_FRENTE";
-        case NO_FINAL_CRUZAMENTO: return "CRUZAMENTO";
-        case NO_FINAL_RETA_SIMPLES: return "RETA_SIMPLES_POS_CONFIRMACAO"; // Para o caso pós-confirmação
-        case NO_FINAL_FIM_DO_LABIRINTO: return "FIM_DO_LABIRINTO"; // <<< ADICIONAR
-        default: return "NO_DESCONHECIDO (" + String(tipo) + ")";
-    }
-}
-
 void pid_controlado_web() {
-    if (estadoRoboAtual != SEGUINDO_LINHA_WEB) return;
+    //if (estadoRobo != SEGUINDO_LINHA_WEB) return;
+    if (estadoRobo != PRINC_PROCESSANDO_NO_DFS) return;
 
     lerSens(); 
     second_lastError = lastError;
     lastError = error;
     error = posicaoPID_3sensores - setPoint_PID_3sensores; 
-
+    
+    //if(abs(error - lastError) > 30 || abs(error - second_lastError) > 30) error = 0; // Evita saltos grandes no erro, o que poderia causar PID instável
+    if(bra.sensorVePreto(S_CENTRAL_MEIO) && bra.sensorVePreto(S_CENTRAL_DIREITO) && bra.sensorVePreto(S_CENTRAL_ESQUERDO)) {
+        // Se os 3 centrais estão pretos, é uma linha reta
+        error = 0; // Reseta o erro para evitar correções desnecessárias
+    }
+    if(bra.sensorVePreto(S_CENTRAL_MEIO) && (bra.sensorVePreto(S_DIREITO_INTERNO) || bra.sensorVePreto(S_ESQUERDO_INTERNO))) {
+        // Se o sensor central e pelo menos um dos internos estão pretos, é uma linha reta
+        error = 0; // Reseta o erro para evitar correções desnecessárias
+    }
     TipoDePadraoSensor padraoAtual = detectarPadraoSensores(); // Chama a função principal de detecção
 
+    //bra.bcSerialln("erro: " + String(error) + " pa: " + String(padraoAtual));
     // Se for linha reta, continua o PID
     if (padraoAtual == PADRAO_LINHA_RETA) {
         I_pid = I_pid + error;
@@ -856,35 +693,45 @@ void pid_controlado_web() {
         else bra.mover('e', 'f', abs(m2Speed_web));
         return; // Continua seguindo linha
     }
+    else
+    {
+        TipoDeNoFinal identificado_x = bra.identificarTipoDeNo(padraoAtual).tipo;
+        bra.bcSerialln("Nó idenficado: " + String(identificado_x));
+        bra.bcSerialln("PosAtual: " + String(bra.orientacaoAtualRobo));
+        if(identificado_x == NO_FINAL_CURVA_90_DIR) 
+        { 
+            bra.girar90GrausDireita(true);
+            bra.atualizarOrientacaoAposVirada(ACAO_DFS_VIRAR_DIREITA);
+            bra.bcSerialln("VIROU 90 DIREITA");
+        }
+        
+
+         if(identificado_x == NO_FINAL_BECO_SEM_SAIDA) {
+            bra.girar180Graus(true); // Gira 180 graus se for beco sem saída
+            bra.atualizarOrientacaoAposVirada(ACAO_DFS_RETROCEDER_180); 
+            bra.bcSerialln("VIROU 180");
+         }
+
+        if(identificado_x == NO_FINAL_CURVA_90_ESQ)
+        { 
+            bra.girar90GrausEsquerda(true);
+            bra.atualizarOrientacaoAposVirada(ACAO_DFS_VIRAR_ESQUERDA);
+            bra.bcSerialln("VIROU 90 ESQUERDA");
+        }
+
+         
+        bra.bcSerialln("PosAtual: " + String(bra.orientacaoAtualRobo));
+        estadoRobo = PARADO_WEB;
+
+
+    }
 
     // Se NÃO for PADRAO_LINHA_RETA, é um evento que requer parada e análise.
     pararMotoresWebService(); 
     I_pid = 0; 
     padraoInicialDetectado = padraoAtual; // GUARDA O PADRÃO QUE CAUSOU A PARADA
 
-    // Log do padrão detectado
-    // Para ter o nome do padrão, você precisaria de uma função similar a nomeDoNo() para TipoDePadraoSensor
-    // Ex: String nomePadrao = obterNomeDoPadrao(padraoAtual);
-    // bra.bcSerialln("[PID_CTRL] Padrão detectado: " + nomePadrao + ". Iniciando análise de nó...");
-    bra.bcSerialln("[PID_CTRL] Padrão bruto " + String(padraoAtual) + " detectado. Iniciando análise...");
 
-
-    if (padraoAtual == PADRAO_QUASE_TUDO_BRANCO) {
-        ultimoNoClassificado = NO_FINAL_BECO_SEM_SAIDA;
-        // A mensagem "Decisão Final do Nó" será impressa ao entrar em EM_NO_WEB
-        estadoRoboAtual = EM_NO_WEB; 
-    } 
-    // Adicionado para tratar o FIM diretamente se o padrão for muito claro
-    else if (padraoAtual == PADRAO_MUITOS_SENSORES_PRETOS) {
-        //ultimoNoClassificado = NO_FINAL_FIM_DO_LABIRINTO; // Classifica direto
-        // A mensagem "Decisão Final do Nó" será impressa ao entrar em EM_NO_WEB
-        //estadoRoboAtual = EM_NO_WEB;
-        estadoRoboAtual = PREPARANDO_ANALISE_NO; 
-    }
-    else { 
-        // Para outros padrões (AMBIGUO, LATERAL_FORTE), inicia a sequência de confirmação com avanços
-        estadoRoboAtual = PREPARANDO_ANALISE_NO; 
-    }
 }
 
 // Nova função para classificar após o avanço
@@ -945,42 +792,77 @@ void classificarNoAposAvanco(TipoDePadraoSensor padraoDetectadoAntesDoAvanco) {
 
     // --- Transição de Estado Final --- (Esta parte do código parece boa)
     if (ultimoNoClassificado == NO_FINAL_NAO_E || ultimoNoClassificado == NO_FINAL_RETA_SIMPLES) {
-        estadoRoboAtual = SEGUINDO_LINHA_WEB; 
+        estadoRobo = SEGUINDO_LINHA_WEB; 
         bra.bcSerialln("[ClassificaFinal] Decisão: Não é nó para parar / Reta. Retomando seguimento.");
     } else {
-        estadoRoboAtual = EM_NO_WEB; 
+        estadoRobo = EM_NO_WEB; 
         // A mensagem "Decisão Final do Nó: ..." será impressa ao entrar no case EM_NO_WEB
     }
 }
 
 
 void handleIniciarWeb() {
-    Serial.println("Comando Web 'Iniciar Exploração'!");
-    if (estadoRoboAtual == PARADO_WEB || estadoRoboAtual == EM_NO_WEB || estadoRoboAtual == PAUSADO_WEB) {
-        estadoRoboAtual = INICIANDO_EXPLORACAO_WEB;
+    bra.bcSerialln("Comando Web 'Iniciar Exploração'!");
+    if (estadoRobo == PARADO_WEB || estadoRobo == EM_NO_WEB || estadoRobo == PAUSADO_WEB) {
+        estadoRobo = PRINC_SEGUINDO_LINHA_DFS;
         exploracaoWebIniciada = true;
         error = 0; lastError = 0; second_lastError = 0; I_pid = 0;
         httpServer.send(200, "text/plain", "Robô iniciando exploração!");
     } else { httpServer.send(200, "text/plain", "Robô ocupado ou em estado incompatível."); }
 }
 
+void handleIniciarMapeamentoDFS() { // Novo nome para clareza
+    bra.bcSerialln("Comando 'Iniciar Mapeamento DFS'!");
+    // if (estadoRobo == PRINC_PARADO || estadoRobo == PRINC_MAPEAMENTO_CONCLUIDO_DFS || estadoRobo == PRINC_ERRO_DFS) { // Verifica se está num estado válido para iniciar
+        bra.pararMotores(); // Garante que está parado antes de iniciar
+
+        // Resetar variáveis de controle do DFS
+        idNoAtualWeb = 0;      // O primeiro nó terá ID 0
+        idNoAnteriorWeb = -1;  // Não há nó anterior ao primeiro
+        idProximoNoWeb = 1;    // O próximo nó descoberto será 1
+        primeiroNoDaExploracao = true;
+        nosCriadosVisualmente.clear();
+        dfs.resetar(); // Reseta o mapa e a pilha do DFS
+        webSocketServer.broadcastTXT("clearGraph"); // Envia comando para limpar o grafo na interface web (você precisará implementar isso no JS)
+
+        bra.orientacaoAtualRobo = NORTE; // Robô sempre começa virado para NORTE no DFS
+
+        // Simula a detecção do primeiro "evento" para forçar a identificação do nó inicial
+        padraoInicialDetectadoGlobal = PADRAO_AMBIGUO; // Ou qualquer padrão que não seja LINHA_RETA
+        I_pid = 0; error = 0; lastError = 0; second_lastError = 0; // Reseta variáveis PID
+
+        estadoRobo = PRINC_PROCESSANDO_NO_DFS; // Muda para o estado de processar o nó inicial
+        webSocketServer.broadcastTXT("estadoRobo: PRINC_PROCESSANDO_NO_DFS: " + String(estadoRobo)); // Notifica a interface web
+        httpServer.send(200, "text/plain", "Robô iniciando mapeamento DFS!");
+    // } else {
+    //     httpServer.send(200, "text/plain", "Robô ocupado ou em estado incompatível para iniciar DFS.");
+    // }
+}
+
 void handleRetornarWeb() {
-    Serial.println("Comando Web 'Retornar ao Início'!");
-    pararMotoresWebService(); estadoRoboAtual = PARADO_WEB; 
-    httpServer.send(200, "text/plain", "Robô parando. Retorno não implementado.");
+    //Serial.println("Comando Web 'Retornar ao Início'!");
+    //pararMotoresWebService(); estadoRobo = PARADO_WEB; 
+    bra.bcSerialln("S1: " + String(sensorValues[S_ESQUERDO_EXTREMO]) + 
+                   " S2: " + String(sensorValues[S_ESQUERDO_INTERNO]) + 
+                   " S3: " + String(sensorValues[S_CENTRAL_ESQUERDO]) + 
+                   " S4: " + String(sensorValues[S_CENTRAL_MEIO]) + 
+                   " S5: " + String(sensorValues[S_CENTRAL_DIREITO]) + 
+                   " S6: " + String(sensorValues[S_DIREITO_INTERNO]) + 
+                   " S7: " + String(sensorValues[S_DIREITO_EXTREMO]));
+    //httpServer.send(200, "text/plain", "Robô parando. Retorno não implementado.");
 }
 
 void handlePausarWeb() {
-    if (estadoRoboAtual == SEGUINDO_LINHA_WEB || estadoRoboAtual == INICIANDO_EXPLORACAO_WEB) {
-        pararMotoresWebService(); estadoRoboAtual = PAUSADO_WEB;
+    if (estadoRobo == SEGUINDO_LINHA_WEB || estadoRobo == INICIANDO_EXPLORACAO_WEB) {
+        pararMotoresWebService(); estadoRobo = PAUSADO_WEB;
         Serial.println("Robô PAUSADO (Web).");
         httpServer.send(200, "text/plain", "Robô pausado.");
     } else { httpServer.send(200, "text/plain", "Não é possível pausar neste estado."); }
 }
 
 void handleContinuarWeb() {
-    if (estadoRoboAtual == PAUSADO_WEB) {
-        estadoRoboAtual = SEGUINDO_LINHA_WEB; 
+    if (estadoRobo == PAUSADO_WEB) {
+        estadoRobo = SEGUINDO_LINHA_WEB; 
         Serial.println("Robô CONTINUANDO (Web).");
         httpServer.send(200, "text/plain", "Robô continuando.");
     } else { httpServer.send(200, "text/plain", "Robô não estava pausado."); }
@@ -988,12 +870,12 @@ void handleContinuarWeb() {
 
 void handleRecalibrarLinhaWeb() {
     Serial.println("Comando Web 'Recalibrar Linha'!");
-    if (estadoRoboAtual != CALIBRANDO_LINHA_WEB) {
-        estadoRoboAtual = CALIBRANDO_LINHA_WEB; // Sinaliza para o loop ou executa direto
+    if (estadoRobo != CALIBRANDO_LINHA_WEB) {
+        estadoRobo = CALIBRANDO_LINHA_WEB; // Sinaliza para o loop ou executa direto
         // Para simplificar e dar resposta ao usuário, chamamos direto.
         // A função de calibração é bloqueante.
         executarCalibracaoLinhaWebService(); 
-        // A função executarCalibracaoLinhaWebService já define estadoRoboAtual = PARADO_WEB no final.
+        // A função executarCalibracaoLinhaWebService já define estadoRobo = PARADO_WEB no final.
         httpServer.send(200, "text/plain", "Calibração de linha concluída!");
     } else { httpServer.send(200, "text/plain", "Calibração já em progresso."); }
 }
@@ -1107,7 +989,7 @@ void executarCalibracaoLinhaWebService()
     bra.calibrarSensoresLinha();
     bra.bcSerialln("Calibração de Linha (Web) CONCLUÍDA!");
 
-    estadoRoboAtual = PARADO_WEB; // Define o estado após a calibração
+    estadoRobo = PARADO_WEB; // Define o estado após a calibração
 }
 
 bool virar_direita_90_preciso() {
@@ -1248,7 +1130,7 @@ bool virar_180_preciso() {
 
 
 void callbackParaCriarNoWeb(int id, TipoDeNoFinal tipo, int idPai) {
-    String label = nomeDoNo(tipo) + "_ID" + String(id); // Usa sua função nomeDoNo
+    String label = bra.nomeDoNo(tipo) + "_ID" + String(id); // Usa sua função nomeDoNo
     String msgNode = "newNode:" + String(id) + ":" + label;
     webSocketServer.broadcastTXT(msgNode);
     bra.bcSerialln("[Grafo Web] Nó Criado: ID=" + String(id) + " Label=" + label + " Pai=" + String(idPai));

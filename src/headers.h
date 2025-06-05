@@ -2,6 +2,8 @@
 #include <tipos.h>
 #include "Baratinha.h" // Incluindo a classe Baratinha
 
+void handleIniciarMapeamentoDFS();
+void executar_pid_seguindo_linha_dfs();
 void lerSens();
 void pid_controlado_web();
 void executarCalibracaoLinhaWebService();
@@ -11,7 +13,6 @@ bool sensorVePreto(int sensorIndex);
 bool sensorVeBranco(int sensorIndex);
 TipoDePadraoSensor detectarPadraoSensores();
 String nomeDoNo(TipoDeNoFinal tipo);
-void pid_controlado_web();
 void classificarNoAposAvanco(TipoDePadraoSensor padraoDetectadoAntesDoAvanco);
 void handleIniciarWeb();
 void handleRetornarWeb();

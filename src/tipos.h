@@ -28,6 +28,13 @@ enum TipoDeNoFinal {
     NO_FINAL_FIM_DO_LABIRINTO
 };
 
+enum DirecaoGlobal {
+    NORTE,  // 0
+    LESTE,  // 1
+    SUL,    // 2
+    OESTE   // 3
+};
+
 // Estados do Robô para controle geral e da máquina de estados principal
 enum EstadoRobo {
   PARADO_WEB,
@@ -40,6 +47,13 @@ enum EstadoRobo {
   CONFIRMANDO_FIM_DO_LABIRINTO,
   PAUSADO_WEB,
   EM_NO_WEB,
+  PRINC_PARADO,
+    PRINC_INICIANDO_MAPEAMENTO_DFS,
+    PRINC_SEGUINDO_LINHA_DFS,
+    PRINC_PROCESSANDO_NO_DFS,
+    PRINC_EXECUTANDO_MANOBRA_DFS,
+    PRINC_MAPEAMENTO_CONCLUIDO_DFS,
+    PRINC_ERRO_DFS,
   CALIBRANDO_LINHA_WEB
 };
 
@@ -56,25 +70,41 @@ enum AcaoDFS {
     ACAO_DFS_ERRO
 };
 
-
-struct NodeInfo {
-    int id = -1;                     // ID único do nó (o mesmo que idNoAtual quando foi descoberto)
-    TipoDeNoFinal tipoNo;            // Tipo de nó (CRUZAMENTO, T_JUNCTION, BECO_SEM_SAIDA, etc.)
-    int idPaiDFS = -1;               // ID do nó do qual este nó foi descoberto (pai na árvore DFS)
-    
-    // Saídas disponíveis quando o nó foi analisado pela primeira vez
-    bool saidaDisponivelEsquerda = false;
-    bool saidaDisponivelFrente = false;
-    bool saidaDisponivelDireita = false;
-
-    // Controle de quais saídas já foram exploradas a partir deste nó pelo DFS
-    bool exploradoEsquerda = false;
-    bool exploradoFrente = false;
-    bool exploradoDireita = false;
-
-    bool totalmenteExplorado = false; // Verdadeiro se todas as saídas (exceto o caminho para o pai) foram tentadas
+struct ResultadoAcaoDFS {
+    AcaoDFS acao;
+    int idNoDestino; // ID do nó de destino se a ação for retroceder ou ir para um nó já conhecido. -1 caso contrário.
+    DirecaoGlobal direcaoGlobalParaSeguir; // Direção GLOBAL que o robô deve encarar e seguir.
 };
 
+struct ResultadoIdentificacaoBaratinha {
+    TipoDeNoFinal tipo;
+    bool temSaidaEsquerda;
+    bool temSaidaFrente;
+    bool temSaidaDireita;
+    // Adicione outros campos se necessário, como contagem de sensores pretos na confirmação
+    // int pretosConfirmacao;
+};
+
+struct NodeInfo {
+    int id = -1;
+    TipoDeNoFinal tipoNo;
+    int idPaiDFS = -1;
+    
+    // Saídas disponíveis nas direções GLOBAIS
+    bool saidaDisponivelNorte = false;
+    bool saidaDisponivelLeste = false;
+    bool saidaDisponivelSul = false;
+    bool saidaDisponivelOeste = false;
+
+    // Controle de quais saídas GLOBAIS já foram exploradas
+    bool exploradoNorte = false;
+    bool exploradoLeste = false;
+    bool exploradoSul = false;
+    bool exploradoOeste = false;
+
+    bool totalmenteExplorado = false;
+    DirecaoGlobal direcaoDeChegadaAoPai = NORTE; // Em qual direção o robô se moveu PARA CHEGAR A ESTE NÓ a partir do seu pai
+};
 
 // Você também pode colocar structs aqui se forem usadas por múltiplos arquivos.
 // Por exemplo, se a struct NodeInfo for usada fora da classe DFSManager.
